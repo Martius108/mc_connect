@@ -8,6 +8,7 @@
 import SwiftUI
 
 struct ContentView: View {
+    
     @StateObject private var mqttVM = MqttViewModel(service: MqttService())
 
     var body: some View {
