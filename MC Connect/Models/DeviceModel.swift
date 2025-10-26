@@ -24,13 +24,13 @@ final class Device {
     var isActive: Bool // optional: markiert aktives Device
 
     init(id: String = UUID().uuidString,
-         name: String,
-         type: String = "pico",
-         host: String,
+         name: String = "",
+         type: String = "",
+         host: String = "",
          port: Int = 1883,
          username: String = "",
          password: String = "",
-         clientID: String,
+         clientID: String = "",
          commandTopic: String = "pi/cmd",
          telemetryTopic: String = "pi/telemetry",
          ackTopic: String = "pi/ack",

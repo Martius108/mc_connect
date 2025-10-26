@@ -53,7 +53,7 @@ struct DashboardView: View {
                 }
             }
             .sheet(isPresented: $showingAdd) {
-                DashboardInputView { name, info in
+                DashboardInputView { name, info, device in
                     let db = Dashboard(name: name, info: info)
                     modelContext.insert(db)
                     try? modelContext.save()

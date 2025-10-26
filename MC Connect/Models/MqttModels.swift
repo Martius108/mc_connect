@@ -2,8 +2,6 @@
 //  MqttModels.swift
 //  MC Connect
 //
-//  Created by Martin Lanius on 23.10.25.
-//
 
 import Foundation
 import CocoaMQTT
@@ -34,6 +32,10 @@ protocol MqttServiceType {
 
     func publishJSON(topic: String, object: [String: Any],
                      qos: CocoaMQTTQoS, retain: Bool)
+    
+    // Neu: Config setzen
+    func setConfig(host: String, port: Int, clientID: String, username: String, password: String)
+    func sendCommand(topic: String, message: String)
 }
 
 enum ConnState: String {

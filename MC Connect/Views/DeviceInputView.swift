@@ -11,7 +11,7 @@ struct DeviceInputView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var name: String = ""
-    @State private var type: String = "pico"
+    @State private var type: String = ""
     @State private var host: String = "broker.hivemq.com"
     @State private var port: String = "1883"
     @State private var username: String = ""
@@ -22,6 +22,7 @@ struct DeviceInputView: View {
     @State private var ackTopic: String = "pi/ack"
 
     var onSave: (Device) -> Void
+    var onCreate: (Device) -> Void
 
     var body: some View {
         NavigationView {

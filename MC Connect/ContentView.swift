@@ -8,26 +8,24 @@
 import SwiftUI
 
 struct ContentView: View {
-    
-    @StateObject private var mqttVM = MqttViewModel(service: MqttService())
+    @EnvironmentObject var mqtt: MqttViewModel
 
     var body: some View {
         TabView {
             DashboardView()
-                .environmentObject(mqttVM)
                 .tabItem { Label("Dashboard", systemImage: "square.grid.3x3.fill") }
 
             DevicesView()
-                .environmentObject(mqttVM)
                 .tabItem { Label("Devices", systemImage: "cpu.fill") }
 
             SettingsView()
-                .environmentObject(mqttVM)
                 .tabItem { Label("Settings", systemImage: "gearshape") }
         }
     }
 }
 
 #Preview {
+    // Preview benötigt ein environmentObject, sonst Crash
     ContentView()
+        .environmentObject(MqttViewModel(service: MqttService()))
 }

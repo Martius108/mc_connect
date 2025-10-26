@@ -10,11 +10,13 @@ import SwiftData
 
 @main
 struct MC_ConnectApp: App {
+    @StateObject private var mqtt = MqttViewModel(service: MqttService())
 
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(mqtt)
         }
-        .modelContainer(for: [Dashboard.self, Widget.self])
+        .modelContainer(for: [Dashboard.self, Widget.self, Device.self])
     }
 }
