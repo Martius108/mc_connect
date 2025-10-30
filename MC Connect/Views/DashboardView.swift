@@ -53,10 +53,11 @@ struct DashboardView: View {
                 }
             }
             .sheet(isPresented: $showingAdd) {
+                // Wichtig: DashboardInputView persistiert das Dashboard selbst.
+                // Daher hier keine doppelte Erstellung mehr durchführen.
                 DashboardInputView { name, info, device in
-                    let db = Dashboard(name: name, info: info)
-                    modelContext.insert(db)
-                    try? modelContext.save()
+                    // no-op: DashboardInputView already saved the dashboard in the modelContext.
+                    print("DashboardInputView:onCreate called for '\(name)' device=\(device?.name ?? "nil")")
                 }
                 .presentationDetents([.medium, .large])
             }

@@ -6,13 +6,14 @@
 //
 
 import SwiftUI
+import SwiftData
 
 struct DeviceInputView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var name: String = ""
     @State private var type: String = ""
-    @State private var host: String = "broker.hivemq.com"
+    @State private var host: String = "192.168.178.25"
     @State private var port: String = "1883"
     @State private var username: String = ""
     @State private var password: String = ""
@@ -21,6 +22,7 @@ struct DeviceInputView: View {
     @State private var telemetryTopic: String = "pi/telemetry"
     @State private var ackTopic: String = "pi/ack"
 
+    // Callback(s) vom Aufrufer — Parent macht das Persistieren
     var onSave: (Device) -> Void
     var onCreate: (Device) -> Void
 
@@ -56,26 +58,45 @@ struct DeviceInputView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Speichern") {
-                        guard let p = Int(port) else { return }
-                        let dev = Device(
-                            name: name.isEmpty ? "Device" : name,
-                            type: type,
-                            host: host,
-                            port: p,
-                            username: username,
-                            password: password,
-                            clientID: clientID,
-                            commandTopic: commandTopic,
-                            telemetryTopic: telemetryTopic,
-                            ackTopic: ackTopic,
-                            isActive: false
-                        )
-                        onSave(dev)
-                        dismiss()
+                        createAndReturnDevice()
                     }
-                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || host.isEmpty || clientID.isEmpty)
+                    .disabled(!canSave)
                 }
             }
         }
+    }
+
+    private var canSave: Bool {
+        guard !name.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        guard !host.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        guard Int(port) != nil else { return false }
+        guard !clientID.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        return true
+    }
+
+    private func createAndReturnDevice() {
+        guard let p = Int(port.trimmingCharacters(in: .whitespaces)) else { return }
+
+        let dev = Device(
+            id: UUID().uuidString,
+            name: name.isEmpty ? "Device" : name,
+            type: type,
+            host: host,
+            port: p,
+            username: username,
+            password: password,
+            clientID: clientID.trimmingCharacters(in: .whitespaces),
+            commandTopic: commandTopic,
+            telemetryTopic: telemetryTopic,
+            ackTopic: ackTopic,
+            isActive: false // Parent entscheidet, ob aktiv
+        )
+
+        // Gib das Device an den Parent zurück; Parent ist verantwortlich für insert/save und ggf. isActive setzen.
+        onSave(dev)
+        onCreate(dev) // falls du separate Logik brauchst; sonst kann Parent onCreate leer lassen
+
+        // Dismiss das Sheet
+        dismiss()
     }
 }

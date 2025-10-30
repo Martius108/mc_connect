@@ -15,8 +15,14 @@ final class MqttService: NSObject, MqttServiceType {
     var password: String = "mqsrpss"
     var clientID: String = "ios-\(UUID().uuidString.prefix(8))"
 
-    // ✅ Neu: Device-Zuordnung
+    // ✅ Device-Zuordnung
     private(set) var connectedDeviceId: String?
+    private var topicsToSubscribe: [String] = []
+
+    // TEST override: set this to force using an external short device id (e.g. "esp01")
+    // for subscription/topic matching and for reportedDeviceId in incoming messages.
+    // Set mqtt.testForceDeviceId = "esp01" before calling connect(for:) to activate.
+    public var testForceDeviceId: String? = nil
 
     private var mqtt: CocoaMQTT?
     private(set) var isConnected: Bool = false
@@ -24,8 +30,6 @@ final class MqttService: NSObject, MqttServiceType {
 
     private var onMessage: ((MqttMessage) -> Void)?
     private var onStatus: ((_ connected: Bool, _ state: ConnState) -> Void)?
-
-    private let topicsToSubscribe = ["pi/status", "pi/telemetry", "pi/ack"]
 
     func setConfig(host: String, port: Int, clientID: String, username: String, password: String) {
         print("[MQTT DEBUG] setConfig -> host:\(host) port:\(port) clientID:\(clientID) username:\(username.isEmpty ? "<empty>" : "<set>") password:\(password.isEmpty ? "<empty>" : "<hidden>")")
@@ -57,7 +61,7 @@ final class MqttService: NSObject, MqttServiceType {
         client.username = username
         client.password = password
         client.keepAlive = 60
-        client.autoReconnect = false          // false for explicit debug
+        client.autoReconnect = false
         client.autoReconnectTimeInterval = 3
         client.cleanSession = true
         client.enableSSL = false
@@ -71,11 +75,31 @@ final class MqttService: NSObject, MqttServiceType {
         print("[MQTT DEBUG] client.connect() returned: \(ok)")
     }
 
-    // ✅ Erweitert: Connect mit Device-ID
+    // ✅ Connect mit Device-ID & dynamischen Topics
     func connect(onMessage: @escaping (MqttMessage) -> Void,
                  onStatus: @escaping (_ connected: Bool, _ state: ConnState) -> Void,
                  for deviceId: String? = nil) {
         connectedDeviceId = deviceId
+
+        // Wenn testForceDeviceId gesetzt ist, nutzen wir diese ID für die Subscriptions.
+        if let forced = testForceDeviceId, !forced.isEmpty {
+            print("[MQTT DEBUG] testForceDeviceId active -> using '\(forced)' for subscriptions instead of deviceId=\(deviceId ?? "nil")")
+            topicsToSubscribe = [
+                "device/\(forced)/telemetry/#",
+                "device/\(forced)/status",
+                "device/\(forced)/ack"
+            ]
+        } else if let id = deviceId {
+            // Dynamische Topics nur für das verbundene Device
+            topicsToSubscribe = [
+                "device/\(id)/telemetry/#",
+                "device/\(id)/status",
+                "device/\(id)/ack"
+            ]
+        } else {
+            topicsToSubscribe = []
+        }
+
         connect(onMessage: onMessage, onStatus: onStatus)
     }
 
@@ -165,9 +189,71 @@ extension MqttService: CocoaMQTTDelegate {
     }
 
     func mqtt(_ mqtt: CocoaMQTT, didReceiveMessage message: CocoaMQTTMessage, id: UInt16) {
-        let item = MqttMessage(topic: message.topic, payload: message.string ?? "<binary>")
+        let payloadString = message.string ?? "<binary>"
+        print("[MQTT DEBUG] didReceiveMessage -> topic:\(message.topic) qos:\(message.qos) retained:\(message.retained) payload:\(payloadString)")
+
+        // --- try to parse JSON payload into a dictionary (rawObj)
+        var rawObj: [String: Any]? = nil
+        if let data = payloadString.data(using: .utf8) {
+            if let obj = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
+                rawObj = obj
+            }
+        }
+
+        // Heuristic numeric extraction (value/temperature/humidity/obstacle or plain number)
+        func extractNumeric(from raw: [String: Any]?, asString s: String) -> Double? {
+            if let r = raw {
+                if let v = r["value"] as? Double { return v }
+                if let n = r["value"] as? NSNumber { return n.doubleValue }
+                if let t = r["temperature"] as? Double { return t }
+                if let tS = r["temperature"] as? String, let d = Double(tS) { return d }
+                if let h = r["humidity"] as? Double { return h }
+                if let hS = r["humidity"] as? String, let d = Double(hS) { return d }
+                if let obs = r["obstacle"] as? Bool { return obs ? 1.0 : 0.0 }
+            }
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let d = Double(trimmed) { return d }
+            return nil
+        }
+
+        let numericValue = extractNumeric(from: rawObj, asString: payloadString)
+
+        // Extract topicDeviceId from topic
+        let topicParts = message.topic.split(separator: "/")
+        let topicDeviceId: String? = topicParts.count >= 2 ? String(topicParts[1]) : nil
+
+        // Determine reportedDeviceId from payload keys OR topicDeviceId
+        var reportedDeviceId: String? = rawObj?["deviceId"] as? String
+            ?? rawObj?["id"] as? String
+            ?? rawObj?["devId"] as? String
+            ?? rawObj?["device"] as? String
+            ?? topicDeviceId
+
+        // If testForceDeviceId is set, override both subscription usage (handled in connect(for:))
+        // and also force reportedDeviceId here so UI matching sees the test id.
+        if let forced = testForceDeviceId, !forced.isEmpty {
+            print("[MQTT DEBUG] testForceDeviceId override active -> forcing reportedDeviceId = '\(forced)'")
+            reportedDeviceId = forced
+        }
+
+        // Keep existing onMessage behavior (topic + payload string)
+        let item = MqttMessage(topic: message.topic, payload: payloadString)
+
+        // Deliver to callback on main thread
         DispatchQueue.main.async {
             self.onMessage?(item)
+
+            // Additionally post a Notification that DashboardDetailView / WidgetCard listen to.
+            // userInfo keys: "topic" (String), "payload" (String), "raw" ([String:Any]?), "value" (Double?), "reportedDeviceId" (String?), "topicDeviceId" (String?)
+            var info: [AnyHashable: Any] = [
+                "topic": message.topic,
+                "payload": payloadString,
+                "topicDeviceId": topicDeviceId ?? "",
+                "reportedDeviceId": reportedDeviceId ?? ""
+            ]
+            if let raw = rawObj { info["raw"] = raw }
+            if let v = numericValue { info["value"] = v }
+            NotificationCenter.default.post(name: .mqttTelemetryReceived, object: nil, userInfo: info)
         }
     }
 

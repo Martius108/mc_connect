@@ -2,7 +2,7 @@
 //  WidgetInputView.swift
 //  MC Connect
 //
-//  Created by Martin Lanius on 24.10.25.
+//  Created by Martin Lanius on 23.10.25.
 //
 
 import SwiftUI
@@ -14,6 +14,7 @@ struct WidgetInputView: View {
 
     let dashboard: Dashboard
 
+    // Form state
     @State private var title: String = ""
     @State private var selectedKind: WidgetKind = .value
     @State private var topic: String = ""
@@ -23,7 +24,6 @@ struct WidgetInputView: View {
     @State private var initialValue: String = "0"
     @State private var pinText: String = ""
 
-    // Neue Felder passend zum aktualisierten Widget-Model
     @State private var stepText: String = ""
     @State private var maxHistoryPointsText: String = ""
     @State private var formatText: String = ""
@@ -46,17 +46,30 @@ struct WidgetInputView: View {
                     }
                 }
 
+                Section("Schnell hinzufügen") {
+                    Button {
+                        addBME280Widgets()
+                    } label: {
+                        VStack(alignment: .leading) {
+                            Text("BME280 (Temperatur + Feuchte)")
+                                .bold()
+                            Text("Erstellt zwei sensorAnalog‑Widgets für Temperature (°C) und Humidity (%) basierend auf dem Topic‑Feld.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+
                 Section("MQTT") {
                     TextField("Topic (optional)", text: $topic)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    Text("Beispiel: device/pico01/telemetry/temp")
+                    Text("Beispiel: device/esp01/telemetry oder komplett device/esp01/telemetry/temperature")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
 
                 Section("Werte") {
-                    // Startwert nur für Output-Widgets
                     if selectedKind.isOutput {
                         HStack {
                             Text("Startwert")
@@ -68,7 +81,6 @@ struct WidgetInputView: View {
                         }
                     }
 
-                    // min/max nur für numerische Widgets (sensorAnalog, gauge, slider, progress, value, servo)
                     if selectedKind.isNumeric {
                         HStack {
                             Text("Min")
@@ -97,7 +109,6 @@ struct WidgetInputView: View {
                             .frame(width: 140)
                     }
 
-                    // Schrittweite für Slider/Servo
                     if selectedKind == .slider || selectedKind == .servo {
                         HStack {
                             Text("Schrittweite")
@@ -110,7 +121,6 @@ struct WidgetInputView: View {
                     }
                 }
 
-                // Options / Picker
                 if selectedKind == .picker {
                     Section("Optionen") {
                         TextField("Optionen (CSV)", text: $optionsText)
@@ -122,7 +132,6 @@ struct WidgetInputView: View {
                     }
                 }
 
-                // Chart / Telemetry settings
                 if selectedKind == .chart || selectedKind == .sensorAnalog {
                     Section("Telemetry / Chart") {
                         HStack {
@@ -153,7 +162,6 @@ struct WidgetInputView: View {
                     }
                 }
 
-                // Hardware / Pin
                 Section("Hardware") {
                     HStack {
                         Text("Pin (optional)")
@@ -166,18 +174,17 @@ struct WidgetInputView: View {
 
                     Toggle("Invertierte Logik (active-low)", isOn: $invert)
 
-                    if selectedKind.isOutput {
-                        Text("Für GPIO-Widgets (z. B. LED) den Pin angeben. Beim Pico W ist die Onboard-LED i. d. R. Pin 25.")
+                    if selectedKind == .sensorBinary {
+                        Text("Gib den Pin an, von dem der Sensor liest (z. B. 26).")
                             .font(.caption)
                             .foregroundColor(.secondary)
-                    } else if selectedKind.isInput {
-                        Text("Gib den Pin an, von dem der Sensor liest (z. B. 26).")
+                    } else if selectedKind.isOutput {
+                        Text("Für GPIO-Widgets (z. B. LED) den Pin angeben. Beim Pico W ist die Onboard-LED i. d. R. Pin 25.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
                 }
 
-                // Debounce für digitale Sensoren
                 if selectedKind == .sensorBinary {
                     Section("Sensor") {
                         HStack {
@@ -207,6 +214,7 @@ struct WidgetInputView: View {
         }
     }
 
+    // MARK: - Add single widget
     private func addWidget() {
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanTitle.isEmpty else { return }
@@ -220,9 +228,8 @@ struct WidgetInputView: View {
         let cleanUnit = unit.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let nextOrder = (dashboard.widgets.map(\.order).max() ?? -1) + 1
-        let pin = Int(pinText.trimmingCharacters(in: .whitespacesAndNewlines)) // nil wenn leer/ungültig
+        let pin = Int(pinText.trimmingCharacters(in: .whitespacesAndNewlines))
 
-        // Neue Felder konvertieren
         let step = Double(stepText.trimmingCharacters(in: .whitespacesAndNewlines))
         let maxHistoryPoints = Int(maxHistoryPointsText.trimmingCharacters(in: .whitespacesAndNewlines))
         let format = formatText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : formatText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -230,6 +237,7 @@ struct WidgetInputView: View {
         let debounceMs = Int(debounceMsText.trimmingCharacters(in: .whitespacesAndNewlines))
         let optionsCSV = optionsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : optionsText.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        // Create a Widget (uses your Widget model)
         let widget = Widget(
             title: cleanTitle,
             value: initial,
@@ -249,7 +257,78 @@ struct WidgetInputView: View {
             optionsCSV: optionsCSV
         )
 
+        // Persist: insert into modelContext and link to dashboard
+        modelContext.insert(widget)
         dashboard.widgets.append(widget)
+        dashboard.updatedAt = Date()
+
+        try? modelContext.save()
+        dismiss()
+    }
+
+    // MARK: - BME280 helper
+    private func addBME280Widgets() {
+        let cleanTopic = topic.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = cleanTopic.isEmpty ? "device/esp01/telemetry" : cleanTopic
+
+        let tempTopic: String
+        let humTopic: String
+        if base.contains("temperature") && !base.contains("humidity") {
+            tempTopic = base
+            humTopic = base.replacingOccurrences(of: "temperature", with: "humidity")
+        } else if base.contains("humidity") && !base.contains("temperature") {
+            humTopic = base
+            tempTopic = base.replacingOccurrences(of: "humidity", with: "temperature")
+        } else {
+            tempTopic = base + "/temperature"
+            humTopic = base + "/humidity"
+        }
+
+        let nextOrder = (dashboard.widgets.map(\.order).max() ?? -1) + 1
+
+        let tempWidget = Widget(
+            title: "Temperatur",
+            value: 0,
+            minValue: Double(minValue) ?? -20,
+            maxValue: Double(maxValue) ?? 60,
+            unit: "°C",
+            kind: .sensorAnalog,
+            topic: tempTopic,
+            order: nextOrder,
+            pin: nil,
+            step: nil,
+            maxHistoryPoints: Int(maxHistoryPointsText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 500,
+            format: formatText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "%.1f °C" : formatText.trimmingCharacters(in: .whitespacesAndNewlines),
+            refreshInterval: Int(refreshIntervalText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 5,
+            debounceMs: nil,
+            invert: false,
+            optionsCSV: nil
+        )
+
+        let humWidget = Widget(
+            title: "Luftfeuchte",
+            value: 0,
+            minValue: 0,
+            maxValue: 100,
+            unit: "%",
+            kind: .sensorAnalog,
+            topic: humTopic,
+            order: nextOrder + 1,
+            pin: nil,
+            step: nil,
+            maxHistoryPoints: Int(maxHistoryPointsText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 500,
+            format: "%.1f %",
+            refreshInterval: Int(refreshIntervalText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 5,
+            debounceMs: nil,
+            invert: false,
+            optionsCSV: nil
+        )
+
+        modelContext.insert(tempWidget)
+        modelContext.insert(humWidget)
+
+        dashboard.widgets.append(tempWidget)
+        dashboard.widgets.append(humWidget)
         dashboard.updatedAt = Date()
 
         try? modelContext.save()
@@ -258,9 +337,7 @@ struct WidgetInputView: View {
 }
 
 // MARK: - WidgetKind Erweiterung
-
 extension WidgetKind {
-    // Welche WidgetKinds gelten als Outputs (schaltbar / stellbar)
     var isOutput: Bool {
         switch self {
         case .toggle, .switcher, .button, .slider, .servo, .rgb:
@@ -279,7 +356,6 @@ extension WidgetKind {
         }
     }
 
-    // Numerische Widgets (zeigen / messen numerische Werte)
     var isNumeric: Bool {
         switch self {
         case .gauge, .value, .slider, .servo, .progress, .sensorAnalog:

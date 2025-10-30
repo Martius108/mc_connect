@@ -2,6 +2,8 @@
 //  MqttModels.swift
 //  MC Connect
 //
+//  Created by Martin Lanius on 25.10.25.
+//
 
 import Foundation
 import CocoaMQTT

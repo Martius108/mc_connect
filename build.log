@@ -1,0 +1,6 @@
+Command line invocation:
+    /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -workspace "MC Connect.xcworkspace" -scheme "MC Connect" -sdk iphonesimulator -destination "platform=iOS Simulator,name=iPhone 16" clean build
+
+Build settings from command line:
+    SDKROOT = iphonesimulator26.0
+

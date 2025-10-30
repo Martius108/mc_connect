@@ -2,12 +2,15 @@
 //  DashboardInputView.swift
 //  MC Connect
 //
+//  Created by Martin Lanius on 23.10.25.
+//
 
 import SwiftUI
 import SwiftData
 
 struct DashboardInputView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var modelContext
     @Query private var devices: [Device]
 
     @State private var name: String = ""
@@ -47,18 +50,51 @@ struct DashboardInputView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Anlegen") {
-                        let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !n.isEmpty else { return }
-                        let i = info.trimmingCharacters(in: .whitespacesAndNewlines)
-                        let device = selectedDeviceId.flatMap { id in
-                            devices.first { $0.id == id }
-                        }
-                        onCreate(n, i.isEmpty ? nil : i, device)
-                        dismiss()
+                        createDashboardAndPersist()
                     }
                     .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
+            .onAppear {
+                // Wenn genau ein Device vorhanden ist, automatisch auswählen (UX)
+                if devices.count == 1 && selectedDeviceId == nil {
+                    selectedDeviceId = devices.first?.id
+                }
+            }
         }
+    }
+
+    // MARK: - Create & persist Dashboard
+    private func createDashboardAndPersist() {
+        let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !n.isEmpty else { return }
+        let i = info.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Find selected device object (if any)
+        let device = selectedDeviceId.flatMap { id in
+            devices.first { $0.id == id }
+        }
+
+        // Create Dashboard model instance and set deviceId
+        // NOTE: Assumes Dashboard(name:) initializer exists in your model.
+        let dash = Dashboard(name: n)
+        dash.info = i.isEmpty ? nil : i
+        dash.deviceId = device?.id
+        dash.createdAt = Date()
+        dash.updatedAt = Date()
+
+        // Persist immediate in modelContext to ensure deviceId is stored
+        modelContext.insert(dash)
+        do {
+            try modelContext.save()
+            print("Dashboard created with deviceId = \(dash.deviceId ?? "nil")")
+        } catch {
+            print("Fehler beim Speichern des Dashboards: \(error)")
+        }
+
+        // Call existing callback for compatibility
+        onCreate(n, i.isEmpty ? nil : i, device)
+
+        dismiss()
     }
 }

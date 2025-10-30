@@ -12,11 +12,12 @@ import CocoaMQTT
 struct DeviceDetailView: View {
     @EnvironmentObject var mqtt: MqttViewModel
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) private var dismiss
 
     @Bindable var device: Device   // SwiftData @Model binding
 
-    @State private var ledOn: Bool = false
-    @State private var showAlert = false
+    @Query private var dashboards: [Dashboard] // zum Bereinigen beim Löschen
+
     @State private var isProcessing = false
 
     var body: some View {
@@ -37,115 +38,42 @@ struct DeviceDetailView: View {
                 SecureField("Password", text: $device.password)
             }
 
-            Section("Connection") {
-                HStack {
-                    Text("Broker Status")
-                    Spacer()
-                    ConnectionStatusDot(connected: mqtt.isConnected)
-                    Text(mqtt.connectionState.rawValue)
-                        .foregroundColor(.secondary)
-                }
+            // Telemetry entfernt wie gewünscht
 
-                HStack {
-                    Button(action: {
-                        Task {
-                            await connectToDevice()
-                        }
-                    }) {
-                        Text("Verbinden")
+            Section {
+                Button(role: .destructive) {
+                    deleteDevice()
+                } label: {
+                    HStack {
+                        Image(systemName: "trash")
+                        Text("Löschen")
                     }
-                    .disabled(isProcessing || mqtt.isConnected)
-
-                    Spacer()
-
-                    Button(action: {
-                        disconnect()
-                    }) {
-                        Text("Trennen")
-                            .foregroundColor(.red)
-                    }
-                    .disabled(isProcessing || !mqtt.isConnected)
-                }
-            }
-
-            Section("Actions") {
-                HStack(spacing: 12) {
-                    Button {
-                        Task {
-                            await mqtt.publishAsync(topic: "pi/cmd", json: ["target": "led", "value": 1])
-                            await MainActor.run { ledOn = true }
-                        }
-                    } label: {
-                        Text("LED ON")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .applyPrimaryStyle(isActive: ledOn, color: Color.blue)
-                    .disabled(!mqtt.isConnected)
-
-                    Button {
-                        Task {
-                            await mqtt.publishAsync(topic: "pi/cmd", json: ["target": "led", "value": 0])
-                            await MainActor.run { ledOn = false }
-                        }
-                    } label: {
-                        Text("LED OFF")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .applyPrimaryStyle(isActive: !ledOn, color: Color.blue)
-                    .disabled(!mqtt.isConnected)
-                }
-
-                HStack {
-                    Text("LED Status")
-                    Spacer()
-                    Text(ledOn ? "ON" : "OFF")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundColor(ledOn ? .blue : .secondary)
-                }
-            }
-
-            Section("Telemetry") {
-                if let state = mqtt.lastKnownLedState(for: device.id) {
-                    Text("Letzter LED-State: \(state ? "ON" : "OFF")")
-                        .foregroundColor(.secondary)
-                } else {
-                    Text("Letzte Telemetrie: -")
-                        .foregroundColor(.secondary)
                 }
             }
         }
         .navigationTitle(device.name)
-        .onAppear {
-            if let state = mqtt.lastKnownLedState(for: device.id) {
-                ledOn = state
-            }
-        }
-        .onReceive(mqtt.$lastLedStateByDevice) { map in
-            if let state = map[device.id] {
-                ledOn = state
-            }
-        }
-        .alert("Achtung", isPresented: $showAlert) {
-            Button("Abbrechen", role: .cancel) { }
-            Button("Trotzdem verbinden") {
-                mqtt.disconnect()
-                Task {
-                    await connectToDevice()
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Abbrechen") {
+                    dismiss()
                 }
             }
-        } message: {
-            Text("Ein anderes Device ist bereits verbunden. Möchtest du die Verbindung wechseln?")
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Speichern") {
+                    saveChanges()
+                }
+            }
         }
     }
 
-    // MARK: - Aktionen
+    // MARK: - Aktionen (bestehende Methoden unverändert belassen)
 
     private func connectToDevice() async {
         isProcessing = true
 
         // Prüfen, ob bereits ein anderes Device verbunden ist
         if mqtt.isConnected, let currentId = mqtt.connectedDeviceId, currentId != device.id {
-            showAlert = true
+            // Alert entfernt — Funktion belassen
             isProcessing = false
             return
         }
@@ -177,6 +105,45 @@ struct DeviceDetailView: View {
         isProcessing = true
         mqtt.disconnect()
         isProcessing = false
+    }
+
+    // MARK: - Save / Delete
+
+    private func saveChanges() {
+        do {
+            try modelContext.save()
+        } catch {
+            print("Fehler beim Speichern des Devices: \(error)")
+        }
+        dismiss()
+    }
+
+    // Delete device (ohne Alert)
+    private func deleteDevice() {
+        isProcessing = true
+
+        // Falls derzeit verbunden mit diesem Device -> trennen
+        if mqtt.isConnected, mqtt.connectedDeviceId == device.id {
+            mqtt.disconnect()
+        }
+
+        // Dashboards bereinigen, die diese deviceId haben
+        for d in dashboards where d.deviceId == device.id {
+            d.deviceId = nil
+            d.updatedAt = Date()
+        }
+
+        // Device löschen
+        modelContext.delete(device)
+
+        do {
+            try modelContext.save()
+        } catch {
+            print("Fehler beim Löschen des Devices: \(error)")
+        }
+
+        isProcessing = false
+        dismiss()
     }
 }
 

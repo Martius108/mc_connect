@@ -9,6 +9,11 @@ import Foundation
 import Combine
 import CocoaMQTT
 
+// Central notification name to avoid literal typos across the app
+extension Notification.Name {
+    static let mqttTelemetryReceived = Notification.Name("mqttTelemetryReceived")
+}
+
 @MainActor
 final class MqttViewModel: ObservableObject {
     // Status/Logs
@@ -18,11 +23,17 @@ final class MqttViewModel: ObservableObject {
 
     // Neu: letzte bekannte LED-Zustände pro Device-ID
     @Published private(set) var lastLedStateByDevice: [String: Bool] = [:]
+    
+    // ✅ Exposed property for external override (e.g. "esp01")
+        @Published var testForceDeviceId: String? = nil
 
     // ✅ Neu: aktuell verbundene Device-ID
     @Published private(set) var connectedDeviceId: String?
 
     private let service: MqttServiceType
+
+    // Pending topics that should be subscribed once the connection is established
+    private var pendingSubscribeTopics: [String] = []
 
     init(service: MqttServiceType) {
         self.service = service
@@ -36,6 +47,7 @@ final class MqttViewModel: ObservableObject {
     }
 
     /// Connect — optional mit Device-ID (wird in connectedDeviceId gespeichert)
+    /// Note: call connect(for:subscribeTo:) if you want automatic subscribing right after ConnAck.
     func connect(for deviceId: String? = nil) {
         print("🔌 MqttViewModel.connect(for: \(deviceId ?? "nil")) — starting")
         connectedDeviceId = deviceId
@@ -48,15 +60,34 @@ final class MqttViewModel: ObservableObject {
         }, onStatus: { [weak self] connected, state in
             // marshal UI updates to main actor
             Task { @MainActor in
+                guard let self = self else { return }
                 print("📡 service onStatus -> connected: \(connected), state: \(state)")
-                self?.isConnected = connected
-                self?.connectionState = state
+                self.isConnected = connected
+                self.connectionState = state
+
+                // If connection established, apply any pending subscribes
+                if connected && !self.pendingSubscribeTopics.isEmpty {
+                    print("MQTT: connection established, subscribing pending topics: \(self.pendingSubscribeTopics)")
+                    for t in self.pendingSubscribeTopics {
+                        self.subscribe(topic: t)
+                    }
+                    self.pendingSubscribeTopics.removeAll()
+                }
             }
         })
     }
 
+    /// Connect and request subscription to topics after successful ConnAck.
+    func connect(for deviceId: String? = nil, subscribeTo topics: [String]) {
+        // store pending topics first so onStatus can pick them up
+        self.pendingSubscribeTopics = topics.filter { !$0.isEmpty }
+        connect(for: deviceId)
+    }
+
     func disconnect() {
         print("🔌 MqttViewModel.disconnect()")
+        // clear pending topics when disconnecting
+        pendingSubscribeTopics.removeAll()
         service.disconnect()
         // ensure published change is on main actor
         Task { @MainActor in
@@ -94,9 +125,24 @@ final class MqttViewModel: ObservableObject {
         service.sendCommand(topic: topic, message: message)
     }
 
+    /// Set config explicitly (old method kept)
     func setConfig(host: String, port: Int, clientID: String, username: String, password: String) {
         print("🔧 setConfig -> host:\(host) port:\(port) clientID:\(clientID) username:\(username)")
         service.setConfig(host: host, port: port, clientID: clientID, username: username, password: password)
+    }
+
+    /// New helper: use the clientID provided by the underlying service implementation (if available)
+    func setConfigUsingServiceClientID(host: String, port: Int, username: String, password: String) {
+        // Try to read clientID from concrete service (safe fallback if unavailable)
+        var clientIdToUse = "ios-\(UUID().uuidString.prefix(8))"
+        if let concrete = service as? MqttService {
+            clientIdToUse = concrete.clientID
+        } else if let svcWithClient = (service as AnyObject).value(forKey: "clientID") as? String {
+            clientIdToUse = svcWithClient
+        }
+        print("🔧 setConfigUsingServiceClientID -> host:\(host) port:\(port) clientID:\(clientIdToUse) username:\(username)")
+        // <-- hier port als Int übergeben (kein UInt16-Cast)
+        service.setConfig(host: host, port: port, clientID: clientIdToUse, username: username, password: password)
     }
 
     // MARK: - Helpers
@@ -126,45 +172,101 @@ final class MqttViewModel: ObservableObject {
             messages.removeFirst(messages.count - 500)
         }
 
-        // Versuche, LED-State aus Nachricht zu extrahieren (robustere Behandlung)
-        do {
-            if msg.topic.contains("telemetry") || msg.topic.contains("ack") || msg.topic.contains("status") {
-                if let data = msg.payload.data(using: .utf8),
-                   let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        // Robust parsing: try JSON (allow fragments), otherwise fallback to plain string
+        if let data = msg.payload.data(using: .utf8) {
+            do {
+                let jsonAny = try JSONSerialization.jsonObject(with: data, options: .allowFragments)
+                // jsonAny can be Dictionary, Array, String, Number, Bool, etc.
+                print("📗 parsed payload (allowFragments): \(jsonAny)")
 
-                    // Versuche verschiedene Felder zu lesen
-                    var ledState: Bool? = nil
-
-                    if let valueInt = json["value"] as? Int {
-                        ledState = (valueInt == 1)
-                    } else if let valueBool = json["value"] as? Bool {
-                        ledState = valueBool
-                    } else if let status = json["status"] as? String {
-                        let s = status.lowercased()
-                        if s == "on" || s == "1" || s == "true" {
-                            ledState = true
-                        } else if s == "off" || s == "0" || s == "false" {
-                            ledState = false
-                        }
-                    } else if let target = json["target"] as? String, target == "led", json["value"] == nil {
-                        // maybe payload uses {"target":"led","status":"on"}
-                        if let status = json["status"] as? String {
-                            ledState = (status.lowercased() == "on")
-                        }
-                    }
-
-                    if let isOn = ledState {
-                        // Heuristik: versuche Device-ID aus Topic zu extrahieren
-                        let deviceIdFromTopic = extractDeviceId(from: msg.topic)
-                        let deviceId = deviceIdFromTopic ?? connectedDeviceId ?? "default"
-                        print("🔍 LED state parsed (\(isOn)) for deviceId: \(deviceId) (topic: \(msg.topic))")
-                        lastLedStateByDevice[deviceId] = isOn
-                    }
+                // If it's a dictionary, try to extract telemetry fields (pin/value/obstacle/status/target)
+                if let dict = jsonAny as? [String: Any] {
+                    handleTelemetryDict(topic: msg.topic, dict: dict)
+                } else if let arr = jsonAny as? [Any] {
+                    // Received an array — post as-is
+                    postTelemetryNotification(["topic": msg.topic, "payload": arr])
+                } else if let str = jsonAny as? String {
+                    // simple string payload like "offline" / "online"
+                    postTelemetryNotification(["topic": msg.topic, "payload": str])
+                } else if let num = jsonAny as? NSNumber {
+                    postTelemetryNotification(["topic": msg.topic, "payload": num])
+                } else {
+                    // Unknown type — still forward raw string
+                    postTelemetryNotification(["topic": msg.topic, "payload": msg.payload])
                 }
+            } catch {
+                // JSON parse failed even with allowFragments: fallback to plain string
+                print("⚠️ Error parsing MQTT payload (allowFragments): \(error). Falling back to string.")
+                postTelemetryNotification(["topic": msg.topic, "payload": msg.payload])
             }
-        } catch {
-            print("⚠️ Error parsing MQTT payload: \(error)")
+        } else {
+            // payload couldn't be converted to data — forward raw
+            postTelemetryNotification(["topic": msg.topic, "payload": msg.payload])
         }
+    }
+
+    /// Versucht, typische Telemetrie-Felder zu extrahieren und postet eine Notification.
+    private func handleTelemetryDict(topic: String, dict: [String: Any]) {
+        print("🔎 handleTelemetryDict for topic: \(topic) dict: \(dict)")
+
+        // LED-state detection (robuster)
+        var ledState: Bool? = nil
+        if let valueInt = dict["value"] as? Int {
+            ledState = (valueInt == 1)
+        } else if let valueBool = dict["value"] as? Bool {
+            ledState = valueBool
+        } else if let valueStr = dict["value"] as? String {
+            let s = valueStr.lowercased()
+            if s == "1" || s == "true" || s == "on" { ledState = true }
+            else if s == "0" || s == "false" || s == "off" { ledState = false }
+        } else if let status = dict["status"] as? String {
+            let s = status.lowercased()
+            if s == "on" || s == "1" || s == "true" { ledState = true }
+            else if s == "off" || s == "0" || s == "false" { ledState = false }
+        } else if let target = dict["target"] as? String, (target.lowercased() == "led" || target.lowercased() == "led_ext") {
+            // sometimes payload uses status field instead of value
+            if let status = dict["status"] as? String {
+                let s = status.lowercased()
+                if s == "on" || s == "1" || s == "true" { ledState = true }
+                else if s == "off" || s == "0" || s == "false" { ledState = false }
+            }
+        }
+
+        if let isOn = ledState {
+            let deviceIdFromTopic = extractDeviceId(from: topic)
+            let deviceId = deviceIdFromTopic ?? connectedDeviceId ?? "default"
+            print("🔍 LED state parsed (\(isOn)) for deviceId: \(deviceId) (topic: \(topic))")
+            lastLedStateByDevice[deviceId] = isOn
+        }
+
+        // Telemetry specific: pin/value/obstacle
+        var pin: Int? = nil
+        if let p = dict["pin"] as? Int {
+            pin = p
+        } else if let pStr = dict["pin"] as? String, let p = Int(pStr) {
+            pin = p
+        }
+
+        var value: Double? = nil
+        if let obstacle = dict["obstacle"] as? Bool {
+            value = obstacle ? 1.0 : 0.0
+        } else if let vDouble = dict["value"] as? Double {
+            value = vDouble
+        } else if let vInt = dict["value"] as? Int {
+            value = Double(vInt)
+        } else if let vStr = dict["value"] as? String, let v = Double(vStr) {
+            value = v
+        } else if let stateInt = dict["state"] as? Int {
+            value = Double(stateInt)
+        }
+
+        // Post a Notification with extracted fields (if any) plus raw dict
+        var userInfo: [String: Any] = ["topic": topic, "raw": dict]
+        if let p = pin { userInfo["pin"] = p }
+        if let v = value { userInfo["value"] = v }
+        if let ls = ledState { userInfo["led_state"] = ls }
+
+        postTelemetryNotification(userInfo)
     }
 
     /// Einfache Heuristik, um eine Device-ID aus einem Topic wie "device/<id>/telemetry" zu extrahieren.
@@ -175,9 +277,21 @@ final class MqttViewModel: ObservableObject {
             if comps[0].lowercased() == "device" {
                 return comps[1]
             }
-            // Alternativ: wenn erstes Element nicht generisch (z.B. "pi", "device") return first as id?
-            // Vorsichtig: das ist heuristisch; wir versuchen eher "device/<id>" Pattern
         }
         return nil
+    }
+
+    // MARK: - Notification helper
+
+    /// Post telemetry notification always on main thread and log keys for debugging.
+    private func postTelemetryNotification(_ userInfo: [String: Any]) {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .mqttTelemetryReceived,
+                                            object: nil,
+                                            userInfo: userInfo)
+            #if DEBUG
+            print("🔔 MqttViewModel posted \(Notification.Name.mqttTelemetryReceived.rawValue) -> keys: \(Array(userInfo.keys))")
+            #endif
+        }
     }
 }
