@@ -21,13 +21,10 @@ final class MqttViewModel: ObservableObject {
     @Published var connectionState: ConnState = .disconnected
     @Published var messages: [MqttMessage] = []
 
-    // Neu: letzte bekannte LED-Zustände pro Device-ID
+    // Neu: letzte bekannte LED-Zustände pro Device-externalId
     @Published private(set) var lastLedStateByDevice: [String: Bool] = [:]
-    
-    // ✅ Exposed property for external override (e.g. "esp01")
-        @Published var testForceDeviceId: String? = nil
 
-    // ✅ Neu: aktuell verbundene Device-ID
+    // Neu: aktuell verbundene Device-externalId
     @Published private(set) var connectedDeviceId: String?
 
     private let service: MqttServiceType
@@ -46,19 +43,20 @@ final class MqttViewModel: ObservableObject {
         connect()
     }
 
-    /// Connect — optional mit Device-ID (wird in connectedDeviceId gespeichert)
-    /// Note: call connect(for:subscribeTo:) if you want automatic subscribing right after ConnAck.
+    /// Connect — optional mit deviceExternalId (wird in connectedDeviceId gespeichert)
+    /// Wenn möglich wird die concrete Service-Variante `connect(..., for:)` genutzt,
+    /// damit der Service bereits beim Verbindungsaufbau die richtigen Topics/Subscribes setzen kann.
     func connect(for deviceId: String? = nil) {
         print("🔌 MqttViewModel.connect(for: \(deviceId ?? "nil")) — starting")
         connectedDeviceId = deviceId
 
-        service.connect(onMessage: { [weak self] msg in
-            // service callback may be called off-main; marshal to main actor
+        let onMessageCallback: (MqttMessage) -> Void = { [weak self] msg in
             Task { @MainActor in
                 self?.append(msg)
             }
-        }, onStatus: { [weak self] connected, state in
-            // marshal UI updates to main actor
+        }
+
+        let onStatusCallback: (_ connected: Bool, _ state: ConnState) -> Void = { [weak self] connected, state in
             Task { @MainActor in
                 guard let self = self else { return }
                 print("📡 service onStatus -> connected: \(connected), state: \(state)")
@@ -74,7 +72,15 @@ final class MqttViewModel: ObservableObject {
                     self.pendingSubscribeTopics.removeAll()
                 }
             }
-        })
+        }
+
+        // Prefer to call the service variant that accepts a deviceId if the concrete service supports it.
+        if let concrete = service as? MqttService {
+            concrete.connect(onMessage: onMessageCallback, onStatus: onStatusCallback, for: deviceId)
+        } else {
+            // Fallback to protocol method (service must implement connect(onMessage:onStatus:))
+            service.connect(onMessage: onMessageCallback, onStatus: onStatusCallback)
+        }
     }
 
     /// Connect and request subscription to topics after successful ConnAck.
@@ -151,11 +157,12 @@ final class MqttViewModel: ObservableObject {
         lastLedStateByDevice[id]
     }
 
-    /// Prüft, ob ViewModel aktuell eine Verbindung hat und optional, ob sie zu diesem device gehört.
+    /// Prüft, ob ViewModel aktuell eine Verbindung hat und optional, ob sie zu diesem device (externalId) gehört.
     func isConnectedFor(device: Device) -> Bool {
         guard isConnected else { return false }
         if let cid = connectedDeviceId {
-            return cid == device.id
+            // compare with externalId (device.externalId) — not internal id
+            return cid == device.externalId
         }
         return isConnected
     }
@@ -234,6 +241,7 @@ final class MqttViewModel: ObservableObject {
 
         if let isOn = ledState {
             let deviceIdFromTopic = extractDeviceId(from: topic)
+            // Prefer the topic-extracted id; fall back to currently intended connectedDeviceId
             let deviceId = deviceIdFromTopic ?? connectedDeviceId ?? "default"
             print("🔍 LED state parsed (\(isOn)) for deviceId: \(deviceId) (topic: \(topic))")
             lastLedStateByDevice[deviceId] = isOn
@@ -269,7 +277,7 @@ final class MqttViewModel: ObservableObject {
         postTelemetryNotification(userInfo)
     }
 
-    /// Einfache Heuristik, um eine Device-ID aus einem Topic wie "device/<id>/telemetry" zu extrahieren.
+    /// Einfache Heuristik, um eine Device-externalId aus einem Topic wie "device/<id>/telemetry" zu extrahieren.
     private func extractDeviceId(from topic: String) -> String? {
         let comps = topic.split(separator: "/").map { String($0) }
         // Falls Format "device/<id>/..." -> return <id>

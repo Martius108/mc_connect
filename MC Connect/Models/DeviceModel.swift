@@ -21,7 +21,7 @@ final class Device {
     var commandTopic: String // z.B. "pi/cmd"
     var telemetryTopic: String // z.B. "pi/telemetry"
     var ackTopic: String // z.B. "pi/ack"
-    var externalId: String? // optional: ID, die vom Microcontroller gesendet wird (z.B. "esp01")
+    var externalId: String // optional: ID, die vom Microcontroller gesendet wird (z.B. "esp01")
     var isActive: Bool // optional: markiert aktives Device
 
     init(id: String = UUID().uuidString,
@@ -35,7 +35,7 @@ final class Device {
          commandTopic: String = "pi/cmd",
          telemetryTopic: String = "pi/telemetry",
          ackTopic: String = "pi/ack",
-         externalId: String? = "esp01",
+         externalId: String = "",
          isActive: Bool = false) {
         self.id = id
         self.name = name

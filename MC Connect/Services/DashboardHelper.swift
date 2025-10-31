@@ -17,13 +17,11 @@ extension DashboardDetailView {
         return widgets
     }
 
-    // Connection badge uses effectiveDeviceId (externalId fallback to internal id)
+    // Connection badge uses dashboard.deviceId (externalId)
     var connectionBadge: some View {
         HStack(spacing: 8) {
             Group {
-                let effectiveId = localDevice?.externalId?.isEmpty == false
-                    ? localDevice!.externalId!
-                    : localDevice?.id ?? "unknown"
+                let effectiveId = dashboard.deviceId
 
                 if mqtt.isConnected && mqtt.connectedDeviceId == effectiveId {
                     Circle().foregroundColor(.green).frame(width: 10, height: 10)
@@ -37,9 +35,7 @@ extension DashboardDetailView {
 
             Button(action: {
                 Task {
-                    let effectiveId = localDevice?.externalId?.isEmpty == false
-                        ? localDevice!.externalId!
-                        : localDevice?.id ?? "unknown"
+                    let effectiveId = dashboard.deviceId
 
                     if mqtt.isConnected && mqtt.connectedDeviceId == effectiveId {
                         stopMqttIfOwned()
@@ -48,9 +44,7 @@ extension DashboardDetailView {
                     }
                 }
             }) {
-                let effectiveId = localDevice?.externalId?.isEmpty == false
-                    ? localDevice!.externalId!
-                    : localDevice?.id ?? "unknown"
+                let effectiveId = dashboard.deviceId
                 Text(mqtt.isConnected && mqtt.connectedDeviceId == effectiveId ? "Disconnect" : "Connect")
                     .font(.subheadline)
             }
@@ -61,19 +55,17 @@ extension DashboardDetailView {
     @MainActor
     func startMqttForDashboard(forceReconnect: Bool = false) async {
         print("[Dashboard] startMqttForDashboard(forceReconnect: \(forceReconnect))")
-        guard let dashDeviceId = dashboard.deviceId, !dashDeviceId.isEmpty else {
-            print("[Dashboard] kein deviceId gesetzt; kein MQTT Start")
-            return
-        }
+        let dashDeviceId = dashboard.deviceId // now non-optional and contains externalId
 
+        // Debug: list available devices (optional)
         do {
             let allDevices = try modelContext.fetch(FetchDescriptor<Device>())
             print("[Dashboard] Available devices in modelContext:")
             for device in allDevices {
-                print("  - id: \(device.id), name: \(device.name), clientID: \(device.clientID)")
+                print("  - id: \(device.id), externalId: \(device.externalId), name: \(device.name), clientID: \(device.clientID)")
             }
         } catch {
-            print("[Dashboard] Fehler beim Laden derDevices: \(error)")
+            print("[Dashboard] Fehler beim Laden der Devices: \(error)")
         }
 
         if !forceReconnect, mqtt.isConnected, mqtt.connectedDeviceId == dashDeviceId {
@@ -82,21 +74,14 @@ extension DashboardDetailView {
         }
 
         do {
+            // Find device by externalId (since dashboard.deviceId is externalId)
             let devices = try modelContext.fetch(FetchDescriptor<Device>())
-            guard let device = devices.first(where: { $0.id == dashDeviceId }) else {
-                print("[Dashboard] Device mit id \(dashDeviceId) nicht gefunden")
+            guard let device = devices.first(where: { $0.externalId == dashDeviceId }) else {
+                print("[Dashboard] Device mit externalId '\(dashDeviceId)' nicht gefunden")
                 return
             }
 
-            // Setze externalId zur Laufzeit, falls nil oder leer
-            if device.externalId == nil || device.externalId!.isEmpty {
-                device.externalId = "esp01"
-                print("[Dashboard] Setze externalId auf Default 'esp01'")
-                // Optional: persistieren wenn gewünscht
-                try? modelContext.save()
-            }
-
-            print("[Dashboard] Found device for connection: id=\(device.id), name=\(device.name), clientID=\(device.clientID)")
+            print("[Dashboard] Found device for connection: id=\(device.id), externalId=\(device.externalId), name=\(device.name), clientID=\(device.clientID)")
             localDevice = device
             connecting = true
             lastConnectError = nil
@@ -109,17 +94,8 @@ extension DashboardDetailView {
                 password: device.password
             )
 
-            let effectiveDeviceId = device.externalId?.isEmpty == false ? device.externalId! : device.id
-            print("[Dashboard] Using effectiveDeviceId='\(effectiveDeviceId)' for connection (device.externalId=\(device.externalId ?? "nil"))")
-
-            // Setze override im ViewModel (falls erforderlich vom Service genutzt wird)
-            if let extId = device.externalId, !extId.isEmpty {
-                mqtt.testForceDeviceId = extId
-                print("[Dashboard] Set mqtt.testForceDeviceId = '\(extId)' for external matching")
-            } else {
-                mqtt.testForceDeviceId = nil
-                print("[Dashboard] Cleared mqtt.testForceDeviceId")
-            }
+            // effectiveDeviceId is the externalId (dashboard.deviceId)
+            let effectiveDeviceId = dashDeviceId
 
             let topicsToSubscribe = [
                 "device/\(effectiveDeviceId)/telemetry/#",
@@ -127,6 +103,9 @@ extension DashboardDetailView {
                 "device/\(effectiveDeviceId)/ack"
             ]
             print("[Dashboard] Connecting with topicsToSubscribe: \(topicsToSubscribe)")
+
+            // Call connect for the specific device externalId.
+            // The MqttViewModel / MqttService manages subscriptions based on the provided device id.
             mqtt.connect(for: effectiveDeviceId, subscribeTo: topicsToSubscribe)
 
             let timeoutNanos: UInt64 = 2_500 * 1_000_000
@@ -138,7 +117,7 @@ extension DashboardDetailView {
             }
 
             if mqtt.isConnected {
-                print("[Dashboard] MQTT verbunden für device \(dashDeviceId) (effectiveId=\(effectiveDeviceId))")
+                print("[Dashboard] MQTT verbunden für device (externalId) \(dashDeviceId) (effectiveId=\(effectiveDeviceId))")
             } else {
                 lastConnectError = "Verbindung nicht hergestellt"
                 print("[Dashboard] MQTT konnte nicht verbunden werden für device \(dashDeviceId)")
@@ -152,16 +131,20 @@ extension DashboardDetailView {
 
     @MainActor
     func stopMqttIfOwned() {
-        guard let owned = localDevice else { return }
+        guard localDevice != nil else { return }
         mqtt.disconnect()
+        print("[Dashboard] MQTT disconnected for device externalId=\(dashboard.deviceId)")
         localDevice = nil
-        print("[Dashboard] MQTT disconnected for device \(owned.id)")
     }
 
-    // MARK: - Widget publishing helpers (used inside WidgetCard)
-    func publishBinaryChange(for dashboard: Dashboard, widget: Widget, to newState: Bool) {
+    // NOTE:
+    // The functions below were intentionally renamed to avoid name collisions
+    // with WidgetCard's internal helper methods. They can still be used from
+    // other parts of DashboardDetailView if needed.
+
+    func dashboardPublishBinaryChange(dashboard: Dashboard, widget: Widget, to newState: Bool) {
         guard mqtt.isConnected else { return }
-        let topic = "device/(dashboard.deviceId ?? \"unknown\")/command"
+        let topic = "device/\(dashboard.deviceId)/command"
         if let pin = widget.pin {
             let payload: [String: Any] = ["target": "gpio", "pin": pin, "value": newState ? 1 : 0]
             mqtt.publish(topic: topic, json: payload)
@@ -171,28 +154,45 @@ extension DashboardDetailView {
         }
     }
 
-    func publishMomentary(for dashboard: Dashboard, widget: Widget) {
+    func dashboardPublishMomentary(dashboard: Dashboard, widget: Widget) {
         guard mqtt.isConnected else { return }
-        let topic = "device/(dashboard.deviceId ?? \"unknown\")/command"
+        let topic = "device/\(dashboard.deviceId)/command"
         var payload: [String: Any] = ["target": "button", "value": 1]
         if let pin = widget.pin { payload["pin"] = pin }
         mqtt.publish(topic: topic, json: payload)
     }
 
-    func publishNumericValue(for dashboard: Dashboard, widget: Widget, value: Double) {
+    func dashboardPublishNumericValue(dashboard: Dashboard, widget: Widget, value: Double) {
         guard mqtt.isConnected else { return }
-        let topic = "device/(dashboard.deviceId ?? \"unknown\")/command"
+        let topic = "device/\(dashboard.deviceId)/command"
         var payload: [String: Any] = ["target": "value", "value": value]
         if let pin = widget.pin { payload["pin"] = pin }
         mqtt.publish(topic: topic, json: payload)
     }
 
-    func publishSelection(for dashboard: Dashboard, widget: Widget, selection: String) {
+    func dashboardPublishSelection(dashboard: Dashboard, widget: Widget, selection: String) {
         guard mqtt.isConnected else { return }
-        let topic = "device/(dashboard.deviceId ?? \"unknown\")/command"
+        let topic = "device/\(dashboard.deviceId)/command"
         var payload: [String: Any] = ["target": "select", "value": selection]
         if let pin = widget.pin { payload["pin"] = pin }
         mqtt.publish(topic: topic, json: payload)
+    }
+
+    // --- Minimal compatibility wrappers so old calls still resolve ---
+    func publishBinaryChange(for dashboard: Dashboard, widget: Widget, to newState: Bool) {
+        dashboardPublishBinaryChange(dashboard: dashboard, widget: widget, to: newState)
+    }
+
+    func publishMomentary(for dashboard: Dashboard, widget: Widget) {
+        dashboardPublishMomentary(dashboard: dashboard, widget: widget)
+    }
+
+    func publishNumericValue(for dashboard: Dashboard, widget: Widget, value: Double) {
+        dashboardPublishNumericValue(dashboard: dashboard, widget: widget, value: value)
+    }
+
+    func publishSelection(for dashboard: Dashboard, widget: Widget, selection: String) {
+        dashboardPublishSelection(dashboard: dashboard, widget: widget, selection: selection)
     }
 }
 
@@ -231,12 +231,8 @@ struct WidgetCard: View {
                     if let onToggle = onToggle {
                         onToggle(newState)
                     } else {
-                        // Use Notification to publish via MqttViewModel in the parent view
-                        NotificationCenter.default.post(name: .widgetPublishBinaryChange, object: nil, userInfo: [
-                            "dashboardId": dashboard.id,
-                            "widgetId": widget.id,
-                            "newState": newState
-                        ])
+                        // Default: use WidgetCard's local publishing
+                        publishBinaryChange(to: newState)
                     }
                     widget.value = newState ? 1 : 0
                     dashboard.updatedAt = Date()
@@ -245,10 +241,7 @@ struct WidgetCard: View {
 
             case .button:
                 GenericWidgetView(widget: widget, actionTitle: "Trigger") {
-                    NotificationCenter.default.post(name: .widgetPublishMomentary, object: nil, userInfo: [
-                        "dashboardId": dashboard.id,
-                        "widgetId": widget.id
-                    ])
+                    publishMomentary()
                 }
 
             case .slider:
@@ -270,11 +263,7 @@ struct WidgetCard: View {
                     }
                     HStack {
                         Button("Set") {
-                            NotificationCenter.default.post(name: .widgetPublishNumericValue, object: nil, userInfo: [
-                                "dashboardId": dashboard.id,
-                                "widgetId": widget.id,
-                                "value": widget.value
-                            ])
+                            publishNumericValue(widget.value)
                             dashboard.updatedAt = Date()
                             try? modelContext.save()
                         }
@@ -296,11 +285,7 @@ struct WidgetCard: View {
             case .picker:
                 if let options = widget.options, !options.isEmpty {
                     PickerWidget(options: options, selected: options.first ?? "") { selected in
-                        NotificationCenter.default.post(name: .widgetPublishSelection, object: nil, userInfo: [
-                            "dashboardId": dashboard.id,
-                            "widgetId": widget.id,
-                            "selection": selected
-                        ])
+                        publishSelection(selected)
                         widget.options = widget.options
                         dashboard.updatedAt = Date()
                         try? modelContext.save()
@@ -322,7 +307,7 @@ struct WidgetCard: View {
                         "value": ["r": 255, "g": 128, "b": 0],
                         "pin": widget.pin as Any
                     ]
-                    mqtt.publish(topic: "device/(dashboard.deviceId ?? \"unknown\")/command", json: payload)
+                    mqtt.publish(topic: "device/\(dashboard.deviceId)/command", json: payload)
                 }
 
             case .servo:
@@ -333,11 +318,7 @@ struct WidgetCard: View {
                     }
                     Slider(value: Binding(get: { widget.value }, set: { widget.value = $0 }), in: widget.minValue...widget.maxValue, step: widget.step ?? 1)
                     Button("Set Position") {
-                        NotificationCenter.default.post(name: .widgetPublishNumericValue, object: nil, userInfo: [
-                            "dashboardId": dashboard.id,
-                            "widgetId": widget.id,
-                            "value": widget.value
-                        ])
+                        publishNumericValue(widget.value)
                         dashboard.updatedAt = Date()
                         try? modelContext.save()
                     }
@@ -387,6 +368,43 @@ struct WidgetCard: View {
         }
     }
 
+    // MARK: - WidgetCard-local publishing helper wrappers (avoid name collisions)
+    private func publishBinaryChange(to newState: Bool) {
+        guard mqtt.isConnected else { return }
+        let topic = "device/\(dashboard.deviceId)/command"
+        if let pin = widget.pin {
+            let payload: [String: Any] = ["target": "gpio", "pin": pin, "value": newState ? 1 : 0]
+            mqtt.publish(topic: topic, json: payload)
+        } else {
+            let payload: [String: Any] = ["target": "led", "value": newState ? 1 : 0]
+            mqtt.publish(topic: topic, json: payload)
+        }
+    }
+
+    private func publishMomentary() {
+        guard mqtt.isConnected else { return }
+        let topic = "device/\(dashboard.deviceId)/command"
+        var payload: [String: Any] = ["target": "button", "value": 1]
+        if let pin = widget.pin { payload["pin"] = pin }
+        mqtt.publish(topic: topic, json: payload)
+    }
+
+    private func publishNumericValue(_ value: Double) {
+        guard mqtt.isConnected else { return }
+        let topic = "device/\(dashboard.deviceId)/command"
+        var payload: [String: Any] = ["target": "value", "value": value]
+        if let pin = widget.pin { payload["pin"] = pin }
+        mqtt.publish(topic: topic, json: payload)
+    }
+
+    private func publishSelection(_ selection: String) {
+        guard mqtt.isConnected else { return }
+        let topic = "device/\(dashboard.deviceId)/command"
+        var payload: [String: Any] = ["target": "select", "value": selection]
+        if let pin = widget.pin { payload["pin"] = pin }
+        mqtt.publish(topic: topic, json: payload)
+    }
+
     private func deleteWidget() {
         if let idx = dashboard.widgets.firstIndex(where: { $0.id == widget.id }) {
             dashboard.widgets.remove(at: idx)
@@ -412,17 +430,15 @@ struct WidgetCard: View {
             topicDeviceId = top
         }
 
-        // Fetch the Device corresponding to this dashboard (if available)
+        // Find the Device corresponding to this dashboard by externalId
         var deviceForDashboard: Device? = nil
-        if let dashDeviceId = dashboard.deviceId {
-            if let devices = try? modelContext.fetch(FetchDescriptor<Device>()) {
-                deviceForDashboard = devices.first(where: { $0.id == dashDeviceId })
-            }
+        if let devices = try? modelContext.fetch(FetchDescriptor<Device>()) {
+            deviceForDashboard = devices.first(where: { $0.externalId == dashboard.deviceId })
         }
 
         // If device exists and has no externalId, and we received a reportedDeviceId, set and persist it
         if let dev = deviceForDashboard {
-            if (dev.externalId == nil || dev.externalId?.isEmpty == true), let rep = reportedDeviceId {
+            if dev.externalId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let rep = reportedDeviceId {
                 dev.externalId = rep
                 dashboard.updatedAt = Date()
                 do {
@@ -436,37 +452,46 @@ struct WidgetCard: View {
 
         // Determine whether this incoming message actually belongs to this dashboard/device.
         var belongsToThisDevice = false
-        if let dev = deviceForDashboard {
-            if let rep = reportedDeviceId, let ext = dev.externalId, !ext.isEmpty {
-                if rep == ext {
-                    belongsToThisDevice = true
-                }
-            } else if let top = topicDeviceId {
-                if top == dev.id {
-                    belongsToThisDevice = true
-                }
-            } else if dev.externalId == nil, let rep = reportedDeviceId {
-                // In case we just set externalId above
-                if dev.externalId == rep {
-                    belongsToThisDevice = true
-                }
-            }
-        } else {
-            // No device record found: as fallback, accept messages where topicDeviceId equals dashboard.deviceId
-            if let top = topicDeviceId, let dashId = dashboard.deviceId, top == dashId {
+
+        // If reportedDeviceId is present and matches dashboard.deviceId (externalId), accept
+        if let rep = reportedDeviceId, rep == dashboard.deviceId {
+            belongsToThisDevice = true
+        }
+
+        // If topicDeviceId is present and matches dashboard.deviceId (externalId), accept
+        if !belongsToThisDevice, let top = topicDeviceId, top == dashboard.deviceId {
+            belongsToThisDevice = true
+        }
+
+        // If we have a device record and its externalId matches dashboard.deviceId, that's also ok
+        if !belongsToThisDevice, let dev = deviceForDashboard {
+            if dev.externalId == dashboard.deviceId {
                 belongsToThisDevice = true
             }
         }
 
+        // Fallback: if dashboard.deviceId matches a topic segment (e.g. device/<id>/telemetry)
         if !belongsToThisDevice {
-            print("[WidgetCard] Ignoring telemetry for topic=(topic) — not matching device (reportedDeviceId=(reportedDeviceId ?? \"nil\") topicDeviceId=(topicDeviceId ?? \"nil\"))")
+            let parts = topic.split(separator: "/")
+            if parts.count >= 2 {
+                let maybeId = String(parts[1])
+                if maybeId == dashboard.deviceId {
+                    belongsToThisDevice = true
+                }
+            }
+        }
+
+        if !belongsToThisDevice {
+            print("[WidgetCard] Ignoring telemetry for topic=\(topic) — not matching device (reportedDeviceId=\(reportedDeviceId ?? "nil") topicDeviceId=\(topicDeviceId ?? "nil"))")
             return
         }
 
-        // Topic handling
+        // Topic: device/esp01/telemetry/temperature  (oder device/<id>/telemetry)
         let parts = topic.split(separator: "/")
+        // suffix optional — if a fourth segment exists, that is e.g. "temperature"
         let suffix: String? = parts.count >= 4 ? String(parts[3]) : nil
 
+        // If suffix exists, match by it
         if let suffix = suffix {
             if widget.topicSuffix == suffix {
                 if let value = extractNumericValue(from: info) {
@@ -476,6 +501,7 @@ struct WidgetCard: View {
             return
         }
 
+        // No suffix in topic (e.g. "device/<id>/telemetry"), try keys in raw JSON
         if let raw = info["raw"] as? [String: Any] {
             if let widgetSuffix = widget.topicSuffix {
                 if raw.keys.contains(widgetSuffix) {
@@ -484,11 +510,13 @@ struct WidgetCard: View {
                     }
                 }
             } else {
+                // If widget has no topicSuffix, fallback to the raw value or value key
                 if let value = extractNumericValue(from: info) {
                     updateWidgetValueIfNeeded(value)
                 }
             }
         } else {
+            // No raw JSON — as last resort try payload-as-number
             if let value = extractNumericValue(from: info) {
                 updateWidgetValueIfNeeded(value)
             }

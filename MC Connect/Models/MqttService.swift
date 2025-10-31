@@ -6,40 +6,44 @@
 //
 
 import Foundation
+import Combine
 import CocoaMQTT
 
-final class MqttService: NSObject, MqttServiceType {
-    var host: String = "192.168.178.25"
-    var port: UInt16 = 1883
-    var username: String = "mqsr"
-    var password: String = "mqsrpss"
-    var clientID: String = "ios-\(UUID().uuidString.prefix(8))"
+final class MqttService: NSObject, MqttServiceType, ObservableObject {
+    // Broker config
+    @Published var host: String = "192.168.178.25"
+    @Published var port: UInt16 = 1883
+    @Published var username: String = ""
+    @Published var password: String = ""
+    @Published var clientID: String = "ios-\(UUID().uuidString.prefix(8))"
 
-    // ✅ Device-Zuordnung
-    private(set) var connectedDeviceId: String?
-    private var topicsToSubscribe: [String] = []
-
-    // TEST override: set this to force using an external short device id (e.g. "esp01")
-    // for subscription/topic matching and for reportedDeviceId in incoming messages.
-    // Set mqtt.testForceDeviceId = "esp01" before calling connect(for:) to activate.
-    public var testForceDeviceId: String? = nil
+    // ✅ Device-Zuordnung (externalId). Observable damit UI darauf reagieren kann.
+    @Published public private(set) var connectedDeviceId: String?
+    private(set) var topicsToSubscribe: [String] = []
 
     private var mqtt: CocoaMQTT?
-    private(set) var isConnected: Bool = false
-    private(set) var connectionState: ConnState = .disconnected
+    @Published public private(set) var isConnected: Bool = false
+    @Published public private(set) var connectionState: ConnState = .disconnected
 
     private var onMessage: ((MqttMessage) -> Void)?
     private var onStatus: ((_ connected: Bool, _ state: ConnState) -> Void)?
 
+    // MARK: - Configuration
     func setConfig(host: String, port: Int, clientID: String, username: String, password: String) {
-        print("[MQTT DEBUG] setConfig -> host:\(host) port:\(port) clientID:\(clientID) username:\(username.isEmpty ? "<empty>" : "<set>") password:\(password.isEmpty ? "<empty>" : "<hidden>")")
-        self.host = host
-        self.port = UInt16(clamping: port)
-        self.clientID = clientID
-        self.username = username
-        self.password = password
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedClient = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        print("[MQTT DEBUG] setConfig -> host:\(trimmedHost) port:\(port) clientID:\(trimmedClient) username:\(username.isEmpty ? "<empty>" : "<set>") password:\(password.isEmpty ? "<empty>" : "<hidden>")")
+
+        DispatchQueue.main.async {
+            self.host = trimmedHost
+            self.port = UInt16(clamping: port)
+            self.clientID = trimmedClient
+            self.username = username
+            self.password = password
+        }
     }
 
+    // MARK: - Connect / Disconnect
     func connect(onMessage: @escaping (MqttMessage) -> Void,
                  onStatus: @escaping (_ connected: Bool, _ state: ConnState) -> Void) {
         print("[MQTT DEBUG] connect() called -> host:\(host) port:\(port) clientID:\(clientID) username:\(username.isEmpty ? "<empty>" : "<set>")")
@@ -50,8 +54,10 @@ final class MqttService: NSObject, MqttServiceType {
             existing.delegate = nil
             existing.disconnect()
             mqtt = nil
-            isConnected = false
-            connectionState = .disconnected
+            DispatchQueue.main.async {
+                self.isConnected = false
+                self.connectionState = .disconnected
+            }
         }
 
         self.onMessage = onMessage
@@ -75,28 +81,20 @@ final class MqttService: NSObject, MqttServiceType {
         print("[MQTT DEBUG] client.connect() returned: \(ok)")
     }
 
-    // ✅ Connect mit Device-ID & dynamischen Topics
+    // ✅ Connect with Device-ID & dynamic topics
     func connect(onMessage: @escaping (MqttMessage) -> Void,
                  onStatus: @escaping (_ connected: Bool, _ state: ConnState) -> Void,
                  for deviceId: String? = nil) {
-        connectedDeviceId = deviceId
-
-        // Wenn testForceDeviceId gesetzt ist, nutzen wir diese ID für die Subscriptions.
-        if let forced = testForceDeviceId, !forced.isEmpty {
-            print("[MQTT DEBUG] testForceDeviceId active -> using '\(forced)' for subscriptions instead of deviceId=\(deviceId ?? "nil")")
-            topicsToSubscribe = [
-                "device/\(forced)/telemetry/#",
-                "device/\(forced)/status",
-                "device/\(forced)/ack"
-            ]
-        } else if let id = deviceId {
-            // Dynamische Topics nur für das verbundene Device
+        // Decide which deviceId we will consider "connectedDeviceId":
+        if let id = deviceId, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            connectedDeviceId = id
             topicsToSubscribe = [
                 "device/\(id)/telemetry/#",
                 "device/\(id)/status",
                 "device/\(id)/ack"
             ]
         } else {
+            connectedDeviceId = nil
             topicsToSubscribe = []
         }
 
@@ -105,24 +103,30 @@ final class MqttService: NSObject, MqttServiceType {
 
     func disconnect() {
         print("[MQTT DEBUG] disconnect() called")
+        // Clear intended connected device on explicit disconnect
         connectedDeviceId = nil
 
         guard let client = mqtt else {
             print("[MQTT DEBUG] disconnect() -> mqtt == nil (already cleaned)")
-            isConnected = false
-            connectionState = .disconnected
-            onStatus?(false, .disconnected)
+            DispatchQueue.main.async {
+                self.isConnected = false
+                self.connectionState = .disconnected
+                self.onStatus?(false, .disconnected)
+            }
             return
         }
         client.delegate = nil
         client.disconnect()
         mqtt = nil
-        isConnected = false
-        connectionState = .disconnected
-        onStatus?(false, .disconnected)
+        DispatchQueue.main.async {
+            self.isConnected = false
+            self.connectionState = .disconnected
+            self.onStatus?(false, .disconnected)
+        }
         print("[MQTT DEBUG] disconnect() -> cleaned up")
     }
 
+    // MARK: - Subscribe / Publish
     func subscribe(_ topic: String, qos: CocoaMQTTQoS) {
         print("[MQTT DEBUG] subscribe -> \(topic)")
         mqtt?.subscribe(topic, qos: qos)
@@ -133,13 +137,17 @@ final class MqttService: NSObject, MqttServiceType {
         mqtt?.unsubscribe(topic)
     }
 
-    func publishJSON(topic: String, object: [String: Any], qos: CocoaMQTTQoS, retain: Bool) {
+    func publishJSON(topic: String, object: [String: Any], qos: CocoaMQTTQoS = .qos1, retain: Bool = false) {
         guard let mqtt = mqtt else {
             onMessage?(MqttMessage(topic: "app/error", payload: "MQTT client nil"))
             return
         }
         guard isConnected else {
             onMessage?(MqttMessage(topic: "app/error", payload: "Nicht verbunden"))
+            return
+        }
+        guard JSONSerialization.isValidJSONObject(object) else {
+            onMessage?(MqttMessage(topic: "app/error", payload: "JSON ist ungültig"))
             return
         }
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: []),
@@ -179,6 +187,10 @@ extension MqttService: CocoaMQTTDelegate {
 
         if !ok {
             print("[MQTT DEBUG] didConnectAck -> connection rejected by broker (ack=\(ack.rawValue)). Likely auth/ACL/clientID issue.")
+            // In case of reject, clear intended connectedDeviceId so UI doesn't assume connection
+            DispatchQueue.main.async {
+                self.connectedDeviceId = nil
+            }
         } else {
             print("[MQTT DEBUG] didConnectAck -> accepted, auto-subscribing to topics")
             for t in topicsToSubscribe {
@@ -223,18 +235,11 @@ extension MqttService: CocoaMQTTDelegate {
         let topicDeviceId: String? = topicParts.count >= 2 ? String(topicParts[1]) : nil
 
         // Determine reportedDeviceId from payload keys OR topicDeviceId
-        var reportedDeviceId: String? = rawObj?["deviceId"] as? String
+        let reportedDeviceId: String? = rawObj?["deviceId"] as? String
             ?? rawObj?["id"] as? String
             ?? rawObj?["devId"] as? String
             ?? rawObj?["device"] as? String
             ?? topicDeviceId
-
-        // If testForceDeviceId is set, override both subscription usage (handled in connect(for:))
-        // and also force reportedDeviceId here so UI matching sees the test id.
-        if let forced = testForceDeviceId, !forced.isEmpty {
-            print("[MQTT DEBUG] testForceDeviceId override active -> forcing reportedDeviceId = '\(forced)'")
-            reportedDeviceId = forced
-        }
 
         // Keep existing onMessage behavior (topic + payload string)
         let item = MqttMessage(topic: message.topic, payload: payloadString)
@@ -262,6 +267,8 @@ extension MqttService: CocoaMQTTDelegate {
         DispatchQueue.main.async {
             self.isConnected = false
             self.connectionState = .disconnected
+            // Clear connectedDeviceId on unexpected disconnect as well to avoid stale UI state
+            self.connectedDeviceId = nil
             self.onStatus?(false, .disconnected)
         }
     }
@@ -271,6 +278,7 @@ extension MqttService: CocoaMQTTDelegate {
         DispatchQueue.main.async {
             self.isConnected = false
             self.connectionState = .disconnected
+            self.connectedDeviceId = nil
             self.onStatus?(false, .disconnected)
         }
     }

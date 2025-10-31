@@ -13,6 +13,7 @@ struct DeviceInputView: View {
 
     @State private var name: String = ""
     @State private var type: String = ""
+    @State private var externalId: String = ""
     @State private var host: String = "192.168.178.25"
     @State private var port: String = "1883"
     @State private var username: String = ""
@@ -32,7 +33,17 @@ struct DeviceInputView: View {
                 Section("Allgemein") {
                     TextField("Name", text: $name)
                     TextField("Typ (pico/esp32)", text: $type)
+                    TextField("Device ID", text: $externalId)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    if externalId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text("Device ID darf nicht leer sein")
+                            .foregroundColor(.red)
+                            .font(.caption)
+                    }
                 }
+
                 Section("Broker") {
                     TextField("Host", text: $host)
                         .textInputAutocapitalization(.never)
@@ -45,6 +56,7 @@ struct DeviceInputView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 }
+
                 Section("Topics") {
                     TextField("Command Topic", text: $commandTopic)
                     TextField("Telemetry Topic", text: $telemetryTopic)
@@ -67,28 +79,34 @@ struct DeviceInputView: View {
     }
 
     private var canSave: Bool {
-        guard !name.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
-        guard !host.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
-        guard Int(port) != nil else { return false }
-        guard !clientID.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard Int(port.trimmingCharacters(in: .whitespacesAndNewlines)) != nil else { return false }
+        guard !clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        // externalId must not be empty
+        guard !externalId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         return true
     }
 
     private func createAndReturnDevice() {
-        guard let p = Int(port.trimmingCharacters(in: .whitespaces)) else { return }
+        // Safety: validate again
+        let trimmedExternalId = externalId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedExternalId.isEmpty else { return }
+        guard let p = Int(port.trimmingCharacters(in: .whitespacesAndNewlines)) else { return }
 
         let dev = Device(
             id: UUID().uuidString,
             name: name.isEmpty ? "Device" : name,
             type: type,
-            host: host,
+            host: host.trimmingCharacters(in: .whitespacesAndNewlines),
             port: p,
-            username: username,
+            username: username.trimmingCharacters(in: .whitespacesAndNewlines),
             password: password,
-            clientID: clientID.trimmingCharacters(in: .whitespaces),
-            commandTopic: commandTopic,
-            telemetryTopic: telemetryTopic,
-            ackTopic: ackTopic,
+            clientID: clientID.trimmingCharacters(in: .whitespacesAndNewlines),
+            commandTopic: commandTopic.trimmingCharacters(in: .whitespacesAndNewlines),
+            telemetryTopic: telemetryTopic.trimmingCharacters(in: .whitespacesAndNewlines),
+            ackTopic: ackTopic.trimmingCharacters(in: .whitespacesAndNewlines),
+            externalId: trimmedExternalId,
             isActive: false // Parent entscheidet, ob aktiv
         )
 

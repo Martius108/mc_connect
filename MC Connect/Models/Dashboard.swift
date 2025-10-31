@@ -19,14 +19,14 @@ final class Dashboard: Identifiable {
     @Attribute(.unique) var id: UUID = UUID()
     var name: String
     var info: String?
-    var deviceId: String?
+    var deviceId: String
 
     var createdAt: Date = Date()
     var updatedAt: Date = Date()
 
     @Relationship(deleteRule: .cascade) var widgets: [Widget] = []
 
-    init(name: String, info: String? = nil, deviceId: String? = nil) {
+    init(name: String, info: String? = nil, deviceId: String = "") {
         self.name = name
         self.info = info
         self.deviceId = deviceId

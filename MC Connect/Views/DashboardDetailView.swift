@@ -16,7 +16,7 @@ struct DashboardDetailView: View {
     @Bindable var dashboard: Dashboard
     init(dashboard: Dashboard) {
         self._dashboard = Bindable(wrappedValue: dashboard)
-        print("[DashboardDetailView] init with dashboard.id=\(dashboard.id) dashboard.deviceId=\(dashboard.deviceId ?? "nil")")
+        print("[DashboardDetailView] init with dashboard.id=\(dashboard.id) dashboard.deviceId=\(dashboard.deviceId)")
     }
 
     @State var showingAddWidget = false
@@ -38,22 +38,17 @@ struct DashboardDetailView: View {
                         widget: w,
                         dashboard: dashboard,
                         onToggle: { newState in
-                            guard mqtt.isConnected else { return }
-                            let topic = "device/(dashboard.deviceId ?? \"unknown\")/command"
-                            if let pin = w.pin {
-                                let payload: [String: Any] = [
-                                    "target": "gpio",
-                                    "value": newState ? 1 : 0,
-                                    "pin": pin
-                                ]
-                                mqtt.publish(topic: topic, json: payload)
-                            } else {
-                                let payload: [String: Any] = [
-                                    "target": "led",
-                                    "value": newState ? 1 : 0
-                                ]
-                                mqtt.publish(topic: topic, json: payload)
+                            // Ensure a deviceId (externalId) is configured for this dashboard
+                            let deviceId = dashboard.deviceId
+                            guard !deviceId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                                print("[DashboardDetailView] cannot toggle widget: dashboard.deviceId is missing")
+                                return
                             }
+
+                            // Use the central helper to publish the binary change (topic formatting + mqtt checks handled there)
+                            publishBinaryChange(for: dashboard, widget: w, to: newState)
+
+                            // Persist new state locally
                             w.value = newState ? 1 : 0
                             dashboard.updatedAt = Date()
                             try? modelContext.save()
@@ -78,7 +73,7 @@ struct DashboardDetailView: View {
                 .presentationDetents([.medium, .large])
         }
         .onAppear {
-            print("[DashboardDetailView] onAppear - dashboard.id=\(dashboard.id) dashboard.deviceId=\(dashboard.deviceId ?? "nil")")
+            print("[DashboardDetailView] onAppear - dashboard.id=\(dashboard.id) dashboard.deviceId=\(dashboard.deviceId)")
             Task { await startMqttForDashboard() }
         }
         .onDisappear {

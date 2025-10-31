@@ -36,8 +36,8 @@ struct DevicesView: View {
 
                         Spacer()
 
-                        // Determine effectiveId: externalId if set and not empty, otherwise internal id
-                        let effectiveId = (device.externalId?.isEmpty == false) ? device.externalId! : device.id
+                        // Use device.externalId as effectiveId (now always non-optional)
+                        let effectiveId = device.externalId
 
                         // Connected state for this device: compare mqtt.connectedDeviceId with effectiveId
                         let isConnectedForThisDevice = mqtt.isConnected && mqtt.connectedDeviceId == effectiveId
@@ -138,8 +138,8 @@ struct DevicesView: View {
 
     @MainActor
     private func connectToDevice(_ device: Device, forceReconnect: Bool = false) async {
-        // Determine effective device id used by MQTT (externalId if present, else internal id)
-        let effectiveId = (device.externalId?.isEmpty == false) ? device.externalId! : device.id
+        // Use device.externalId as effectiveId (now always non-optional)
+        let effectiveId = device.externalId
 
         // If already connected to this effectiveId and not forcing, nothing to do
         if !forceReconnect, mqtt.isConnected, mqtt.connectedDeviceId == effectiveId {
@@ -159,14 +159,6 @@ struct DevicesView: View {
             username: device.username,
             password: device.password
         )
-
-        // Optional: set a testForceDeviceId if your MqttService uses it for matching
-        if let ext = device.externalId, !ext.isEmpty {
-            mqtt.testForceDeviceId = ext
-            print("[DevicesView] Set mqtt.testForceDeviceId = '\(ext)'")
-        } else {
-            mqtt.testForceDeviceId = nil
-        }
 
         // Topics to subscribe for this device
         let topicsToSubscribe = [

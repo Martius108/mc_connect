@@ -129,7 +129,7 @@ struct DeviceDetailView: View {
 
         // Dashboards bereinigen, die diese deviceId haben
         for d in dashboards where d.deviceId == device.id {
-            d.deviceId = nil
+            d.deviceId = ""
             d.updatedAt = Date()
         }
 
