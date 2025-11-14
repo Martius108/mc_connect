@@ -1,0 +1,459 @@
+//
+//  MqttViewModel.swift
+//  MC_Connect
+//
+//  Created by Martin Lanius on 09.11.25.
+//
+
+import Foundation
+import SwiftUI
+import SwiftData
+import Combine
+
+@MainActor
+class MqttViewModel: ObservableObject {
+    @Published var connectionState: MqttConnectionState = .disconnected
+    @Published var latestTelemetryData: [String: [String: TelemetryData]] = [:] // [deviceId: [keyword: TelemetryData]]
+    @Published var recentPayloads: [PayloadLogEntry] = [] // Log of recent MQTT payloads
+    
+    private let mqttService: MqttServiceProtocol
+    private var cancellables = Set<AnyCancellable>()
+    private var modelContext: ModelContext?
+    private let maxLogEntries = 50 // Maximum number of log entries to keep
+    private var offlineCheckTimer: Timer?
+    private let offlineTimeout: TimeInterval = 30.0 // Mark device as offline after 30 seconds without messages
+    
+    init(mqttService: MqttServiceProtocol? = nil) {
+        self.mqttService = mqttService ?? MqttService()
+        setupSubscriptions()
+    }
+    
+    func setModelContext(_ context: ModelContext) {
+        self.modelContext = context
+    }
+    
+    private var isSubscribing = false // Flag to prevent multiple simultaneous subscriptions
+    
+    private var subscribedDevices: [Device] = [] // Track which devices we're subscribed to
+    private var subscribedKeywords: [String] = [] // Track which keywords we're subscribed to
+    
+    private func setupSubscriptions() {
+        // Subscribe to connection state changes
+        mqttService.connectionState
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                self?.connectionState = state
+                
+                // If we were disconnected unexpectedly (error or disconnect), 
+                // set all devices to offline
+                if case .disconnected = state {
+                    self?.setAllDevicesOffline()
+                } else if case .error = state {
+                    self?.setAllDevicesOffline()
+                }
+                
+                // If we were disconnected unexpectedly (error or disconnect), 
+                // we need to resubscribe when reconnected
+                // Note: DashboardDetailView will handle manual resubscription, 
+                // but we keep this as a backup in case of unexpected disconnects
+                if case .connected = state {
+                    // Auto-resubscribe if we had previous subscriptions and no manual subscription is in progress
+                    // IMPORTANT: Wait longer to ensure DashboardDetailView has time to subscribe first
+                    guard let strongSelf = self,
+                          !strongSelf.subscribedDevices.isEmpty,
+                          !strongSelf.isSubscribing else {
+                        return
+                    }
+                    
+                    Task { @MainActor in
+                        // Wait longer (2s) to ensure DashboardDetailView has time to subscribe first
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        // Only auto-resubscribe if DashboardDetailView hasn't done it yet
+                        guard let strongSelf = self,
+                              !strongSelf.subscribedDevices.isEmpty,
+                              !strongSelf.isSubscribing else {
+                            return
+                        }
+                        
+                        strongSelf.subscribeToAllDevices(devices: strongSelf.subscribedDevices, telemetryKeywords: strongSelf.subscribedKeywords)
+                    }
+                }
+            }
+            .store(in: &cancellables)
+        
+        // Subscribe to incoming messages
+        mqttService.receivedMessages
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] message in
+                self?.handleMessage(message)
+                self?.addToLog(topic: message.topic, payload: message.payload)
+            }
+            .store(in: &cancellables)
+    }
+    
+    private func subscribeToAllDevicesOnConnect() {
+        // This function is no longer used - subscriptions are handled manually
+        // by DashboardDetailView to prevent conflicts
+    }
+    
+    func connect(brokerSettings: BrokerSettings) -> Bool {
+        // Ensure we have a unique client ID to avoid conflicts with other clients
+        var clientId = brokerSettings.clientId
+        if clientId.isEmpty {
+            // Generate a unique client ID with timestamp to avoid conflicts
+            clientId = "MC_Connect_\(UUID().uuidString.prefix(8))_\(Int(Date().timeIntervalSince1970))"
+        } else {
+            // Append timestamp to make it unique even if user provided a static ID
+            clientId = "\(clientId)_\(Int(Date().timeIntervalSince1970))"
+        }
+        
+        let config = MqttConfiguration(
+            host: brokerSettings.host,
+            port: brokerSettings.port,
+            username: brokerSettings.username.isEmpty ? nil : brokerSettings.username,
+            password: brokerSettings.password.isEmpty ? nil : brokerSettings.password,
+            clientId: clientId,
+            keepAlive: brokerSettings.keepAlive
+        )
+        let connected = mqttService.connect(config: config)
+        if connected {
+            startOfflineCheckTimer()
+        }
+        return connected
+    }
+    
+    func disconnect() {
+        mqttService.disconnect()
+        stopOfflineCheckTimer()
+    }
+    
+    private func startOfflineCheckTimer() {
+        stopOfflineCheckTimer()
+        offlineCheckTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            guard let strongSelf = self else { return }
+            Task { @MainActor in
+                await strongSelf.checkDeviceOfflineStatus()
+            }
+        }
+    }
+    
+    private func stopOfflineCheckTimer() {
+        offlineCheckTimer?.invalidate()
+        offlineCheckTimer = nil
+    }
+    
+    private func checkDeviceOfflineStatus() async {
+        guard let context = modelContext else { return }
+        
+        let descriptor = FetchDescriptor<Device>()
+        guard let devices = try? context.fetch(descriptor) else { return }
+        
+        let now = Date()
+        var statusChanged = false
+        for device in devices {
+            if let lastSeen = device.lastSeen {
+                let timeSinceLastSeen = now.timeIntervalSince(lastSeen)
+                if timeSinceLastSeen > offlineTimeout && device.isOnline {
+                    device.isOnline = false
+                    statusChanged = true
+                }
+            } else if device.isOnline {
+                // Device was never seen but marked as online - mark as offline
+                device.isOnline = false
+                statusChanged = true
+            }
+        }
+        
+        if statusChanged {
+            try? context.save()
+            NotificationCenter.default.post(name: NSNotification.Name("DeviceStatusUpdated"), object: nil)
+        }
+    }
+    
+    func subscribeToDeviceTelemetry(deviceId: String, keywords: [String]) {
+        // Subscribe to the required topics for each device
+        // Using QoS 1 for better message delivery guarantee
+        let topicsToSubscribe = [
+            "device/\(deviceId)/telemetry/#",
+            "device/\(deviceId)/status",
+            "device/\(deviceId)/ack"
+        ]
+        _ = mqttService.subscribe(to: topicsToSubscribe, qos: 1)
+    }
+    
+    func subscribeToAllDevices(devices: [Device], telemetryKeywords: [String]) {
+        // Prevent multiple simultaneous subscription attempts
+        guard !isSubscribing else {
+            return
+        }
+        
+        // Store the devices and keywords for auto-resubscription on reconnect
+        subscribedDevices = devices
+        subscribedKeywords = telemetryKeywords
+        
+        isSubscribing = true
+        
+        // Remove data only for devices that are NOT in the new subscription list
+        // Keep existing data for devices that are being resubscribed
+        let deviceIdsToSubscribe = Set(devices.map { $0.id })
+        let existingDeviceIds = Set(latestTelemetryData.keys)
+        
+        // Remove data for devices that are no longer in the subscription list
+        for deviceId in existingDeviceIds {
+            if !deviceIdsToSubscribe.contains(deviceId) {
+                latestTelemetryData.removeValue(forKey: deviceId)
+            }
+        }
+        
+        // Subscribe to all devices sequentially to avoid conflicts
+        Task { @MainActor in
+            for device in devices {
+                subscribeToDeviceTelemetry(deviceId: device.id, keywords: telemetryKeywords)
+                // Small delay between subscriptions to avoid overwhelming the broker
+                try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+            }
+            
+            isSubscribing = false
+        }
+    }
+    
+    func unsubscribeFromDeviceTelemetry(deviceId: String) {
+        // Unsubscribe from all topics for this device
+        let topicsToUnsubscribe = [
+            "device/\(deviceId)/telemetry/#",
+            "device/\(deviceId)/status",
+            "device/\(deviceId)/ack"
+        ]
+        _ = mqttService.unsubscribe(from: topicsToUnsubscribe)
+        
+        // Remove from subscribed devices list
+        subscribedDevices.removeAll { $0.id == deviceId }
+        
+        // Also remove telemetry data for this device from the dictionary
+        latestTelemetryData.removeValue(forKey: deviceId)
+        objectWillChange.send()
+    }
+    
+    private func handleMessage(_ message: MqttMessage) {
+        let (deviceId, keyword) = message.parseTopic()
+        
+        guard let deviceId = deviceId,
+              let keyword = keyword,
+              !deviceId.isEmpty,
+              !keyword.isEmpty else {
+            // Invalid topic format - skip this message
+            return
+        }
+        
+        // Handle status topic - check if it's device/{id}/status or device/{id}/telemetry/status
+        if keyword == "status" {
+            // Check if payload indicates online/offline
+            let payloadLower = message.payload.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            if payloadLower == "online" || payloadLower == "offline" {
+                let isOnline = payloadLower == "online"
+                updateDeviceStatus(deviceId: deviceId, isOnline: isOnline, updateLastSeen: true)
+            } else {
+                // For other status messages, just update last seen (device is online if sending messages)
+                updateDeviceLastSeen(deviceId: deviceId)
+            }
+            return
+        }
+        
+        // Handle ack topic - just update device status (device is online if sending messages)
+        if keyword == "ack" {
+            updateDeviceLastSeen(deviceId: deviceId)
+            return
+        }
+        
+        // For telemetry messages (info, summary, temperature, etc.), device is online
+        // Update device last seen for any message from the device
+        updateDeviceLastSeen(deviceId: deviceId)
+        
+        // Handle telemetry topics - need a value
+        guard let value = message.parseValue() else {
+            return
+        }
+        
+        // Get unit from JSON payload first, then from TelemetryConfig, then enum, then empty string
+        let unit: String
+        if let jsonUnit = message.parseUnit() {
+            unit = jsonUnit
+        } else if let context = modelContext {
+            // Try to get unit from TelemetryConfig
+            let descriptor = FetchDescriptor<TelemetryConfig>()
+            if let config = try? context.fetch(descriptor).first {
+                unit = config.getUnit(for: keyword)
+            } else {
+                unit = TelemetryKeyword(rawValue: keyword)?.unit ?? ""
+            }
+        } else {
+            unit = TelemetryKeyword(rawValue: keyword)?.unit ?? ""
+        }
+        
+        // Update in-memory dictionary for quick access
+        // First, check if we already have this deviceId/keyword combination
+        if latestTelemetryData[deviceId] == nil {
+            latestTelemetryData[deviceId] = [:]
+        }
+        
+        // Check if we need to update existing data or create new
+        // CRITICAL: Always create a NEW TelemetryData object to avoid issues with SwiftData
+        // and to ensure we don't accidentally use stale data from previous connections
+        let telemetryData: TelemetryData
+        let isNewObject: Bool
+        
+        // CRITICAL: Always create a NEW TelemetryData object instead of updating existing ones
+        // This ensures SwiftUI recognizes the change, even when only the value changes
+        // Updating existing objects directly doesn't always trigger SwiftUI updates,
+        // especially when the dictionary structure changes (e.g., when a new device is added)
+        // By creating new objects, we ensure that SwiftUI sees a "new" reference and re-renders
+        
+        // Always create a new object to ensure SwiftUI detects the change
+        telemetryData = TelemetryData(
+            deviceId: deviceId,
+            keyword: keyword,
+            value: value,
+            unit: unit,
+            timestamp: message.timestamp
+        )
+        isNewObject = true
+        
+        // Always update the dictionary to trigger @Published notification
+        // CRITICAL: We must create a NEW dictionary structure to ensure SwiftUI detects the change
+        // Simply updating nested dictionaries doesn't always trigger @Published notifications
+        // IMPORTANT: We must preserve ALL devices and ALL keywords when updating
+        // CRITICAL: Read the current state RIGHT BEFORE updating to avoid race conditions
+        // This ensures we always work with the most recent data, even if another message
+        // updated the dictionary between when we read it earlier and now
+        let currentTelemetryData = latestTelemetryData
+        
+        // Create a completely new top-level dictionary with ALL existing devices preserved
+        var newLatestTelemetryData: [String: [String: TelemetryData]] = [:]
+        
+        // First, copy ALL existing devices and their keywords from the CURRENT state
+        // This ensures we don't lose any updates that happened between reading and writing
+        for (existingDeviceId, existingKeywords) in currentTelemetryData {
+            var deviceKeywords: [String: TelemetryData] = [:]
+            // Copy all keywords for this device
+            for (existingKeyword, existingData) in existingKeywords {
+                deviceKeywords[existingKeyword] = existingData
+            }
+            newLatestTelemetryData[existingDeviceId] = deviceKeywords
+        }
+        
+        // Now update/add the specific device/keyword we're processing
+        if newLatestTelemetryData[deviceId] == nil {
+            newLatestTelemetryData[deviceId] = [:]
+        }
+        newLatestTelemetryData[deviceId]?[keyword] = telemetryData
+        
+        // Assign the new dictionary to trigger @Published
+        latestTelemetryData = newLatestTelemetryData
+        
+        // Explicitly notify SwiftUI of the change
+        // Even though we created a new dictionary, we still call objectWillChange to be safe
+        objectWillChange.send()
+        
+        // Save to SwiftData
+        // Note: We only use SwiftData for persistence, but the in-memory dictionary is the source of truth
+        // We don't need to sync back from SwiftData - the dictionary is always up-to-date
+        if let context = modelContext, isNewObject {
+            // Only insert new objects into SwiftData
+            // Existing objects are already tracked by SwiftData if they were inserted before
+            // If an object exists in the dictionary but not in SwiftData, it means it was created
+            // before the context was set, so we insert it now
+            context.insert(telemetryData)
+            try? context.save()
+        }
+    }
+    
+    private func updateDeviceLastSeen(deviceId: String) {
+        // When receiving telemetry messages, device is online (it's sending data)
+        updateDeviceStatus(deviceId: deviceId, isOnline: true, updateLastSeen: true)
+    }
+    
+    private func updateDeviceStatus(deviceId: String, isOnline: Bool, updateLastSeen: Bool = true) {
+        guard let context = modelContext else { return }
+        
+        let descriptor = FetchDescriptor<Device>(
+            predicate: #Predicate { $0.id == deviceId }
+        )
+        
+        if let device = try? context.fetch(descriptor).first {
+            let statusChanged = device.isOnline != isOnline
+            device.isOnline = isOnline
+            if updateLastSeen {
+                device.lastSeen = Date()
+            }
+            
+            // Force save to ensure SwiftData updates
+            do {
+                try context.save()
+                // Always notify views to refresh when status changes or last seen updates
+                if statusChanged || updateLastSeen {
+                    NotificationCenter.default.post(name: NSNotification.Name("DeviceStatusUpdated"), object: nil)
+                }
+            } catch {
+                // Failed to save device status
+            }
+        }
+    }
+    
+    func getLatestValue(deviceId: String, keyword: String) -> TelemetryData? {
+        return latestTelemetryData[deviceId]?[keyword]
+    }
+    
+    func getAllTelemetryForDevice(deviceId: String) -> [String: TelemetryData] {
+        return latestTelemetryData[deviceId] ?? [:]
+    }
+    
+    private func addToLog(topic: String, payload: String) {
+        let entry = PayloadLogEntry(topic: topic, payload: payload, timestamp: Date())
+        recentPayloads.insert(entry, at: 0)
+        
+        // Keep only the most recent entries
+        if recentPayloads.count > maxLogEntries {
+            recentPayloads = Array(recentPayloads.prefix(maxLogEntries))
+        }
+    }
+    
+    func clearLog() {
+        recentPayloads.removeAll()
+    }
+    
+    func publishCommand(topic: String, payload: String) -> Bool {
+        guard case .connected = connectionState else {
+            return false
+        }
+        return mqttService.publish(topic: topic, payload: payload, qos: 0)
+    }
+    
+    func setAllDevicesOffline() {
+        guard let context = modelContext else { return }
+        
+        let descriptor = FetchDescriptor<Device>()
+        guard let devices = try? context.fetch(descriptor) else { return }
+        
+        var statusChanged = false
+        for device in devices {
+            if device.isOnline {
+                device.isOnline = false
+                statusChanged = true
+            }
+        }
+        
+        if statusChanged {
+            try? context.save()
+            NotificationCenter.default.post(name: NSNotification.Name("DeviceStatusUpdated"), object: nil)
+        }
+    }
+}
+
+// Payload log entry
+struct PayloadLogEntry: Identifiable {
+    let id = UUID()
+    let topic: String
+    let payload: String
+    let timestamp: Date
+}
+

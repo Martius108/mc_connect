@@ -10,46 +10,37 @@ import SwiftData
 
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
-    @Query private var items: [Item]
+    @StateObject private var mqttViewModel = MqttViewModel()
 
     var body: some View {
-        NavigationSplitView {
-            List {
-                ForEach(items) { item in
-                    NavigationLink {
-                        Text("Item at \(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
-                    } label: {
-                        Text(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))
-                    }
+        TabView {
+            DashboardsView()
+                .tabItem {
+                    Label("Dashboards", systemImage: "chart.bar.fill")
                 }
-                .onDelete(perform: deleteItems)
-            }
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    EditButton()
+            
+            DevicesView()
+                .tabItem {
+                    Label("Devices", systemImage: "cpu.fill")
                 }
-                ToolbarItem {
-                    Button(action: addItem) {
-                        Label("Add Item", systemImage: "plus")
-                    }
+            
+            SettingsView()
+                .tabItem {
+                    Label("Settings", systemImage: "gearshape.fill")
                 }
-            }
-        } detail: {
-            Text("Select an item")
         }
-    }
-
-    private func addItem() {
-        withAnimation {
-            let newItem = Item(timestamp: Date())
-            modelContext.insert(newItem)
-        }
-    }
-
-    private func deleteItems(offsets: IndexSet) {
-        withAnimation {
-            for index in offsets {
-                modelContext.delete(items[index])
+        .environmentObject(mqttViewModel)
+        .onAppear {
+            mqttViewModel.setModelContext(modelContext)
+            
+            // Check if MQTT is not connected and set all devices to offline
+            // This ensures that when the app starts, devices don't show as online
+            // if there's no active MQTT connection
+            if case .connected = mqttViewModel.connectionState {
+                // Connected - devices will be updated by incoming messages
+            } else {
+                // Not connected - set all devices to offline immediately
+                mqttViewModel.setAllDevicesOffline()
             }
         }
     }
@@ -57,5 +48,5 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
-        .modelContainer(for: Item.self, inMemory: true)
+        .modelContainer(for: [Device.self, BrokerSettings.self, TelemetryConfig.self, TelemetryData.self, Dashboard.self, Widget.self], inMemory: true)
 }

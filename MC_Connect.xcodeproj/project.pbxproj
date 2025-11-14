@@ -6,6 +6,11 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		CCC85A0C2EC06DD7004D9B4B /* CocoaMQTT in Frameworks */ = {isa = PBXBuildFile; productRef = CCC85A0B2EC06DD7004D9B4B /* CocoaMQTT */; };
+		CCC85A0E2EC06DD7004D9B4B /* CocoaMQTTWebSocket in Frameworks */ = {isa = PBXBuildFile; productRef = CCC85A0D2EC06DD7004D9B4B /* CocoaMQTTWebSocket */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		CCC859FA2EC06D36004D9B4B /* MC_Connect.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MC_Connect.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -23,6 +28,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				CCC85A0E2EC06DD7004D9B4B /* CocoaMQTTWebSocket in Frameworks */,
+				CCC85A0C2EC06DD7004D9B4B /* CocoaMQTT in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -65,6 +72,8 @@
 			);
 			name = MC_Connect;
 			packageProductDependencies = (
+				CCC85A0B2EC06DD7004D9B4B /* CocoaMQTT */,
+				CCC85A0D2EC06DD7004D9B4B /* CocoaMQTTWebSocket */,
 			);
 			productName = MC_Connect;
 			productReference = CCC859FA2EC06D36004D9B4B /* MC_Connect.app */;
@@ -94,6 +103,9 @@
 			);
 			mainGroup = CCC859F12EC06D36004D9B4B;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				CCC85A0A2EC06DD6004D9B4B /* XCRemoteSwiftPackageReference "CocoaMQTT" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = CCC859FB2EC06D36004D9B4B /* Products */;
 			projectDirPath = "";
@@ -256,6 +268,7 @@
 				DEVELOPMENT_TEAM = FTB9X87833;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "MC Connect";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -288,6 +301,7 @@
 				DEVELOPMENT_TEAM = FTB9X87833;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "MC Connect";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -332,6 +346,30 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		CCC85A0A2EC06DD6004D9B4B /* XCRemoteSwiftPackageReference "CocoaMQTT" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/emqx/CocoaMQTT";
+			requirement = {
+				kind = exactVersion;
+				version = 2.0.8;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		CCC85A0B2EC06DD7004D9B4B /* CocoaMQTT */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = CCC85A0A2EC06DD6004D9B4B /* XCRemoteSwiftPackageReference "CocoaMQTT" */;
+			productName = CocoaMQTT;
+		};
+		CCC85A0D2EC06DD7004D9B4B /* CocoaMQTTWebSocket */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = CCC85A0A2EC06DD6004D9B4B /* XCRemoteSwiftPackageReference "CocoaMQTT" */;
+			productName = CocoaMQTTWebSocket;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = CCC859F22EC06D36004D9B4B /* Project object */;
 }
