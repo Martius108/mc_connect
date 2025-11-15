@@ -17,8 +17,13 @@ struct DashboardDetailView: View {
     @EnvironmentObject var mqttViewModel: MqttViewModel
     @State private var showingAddWidget = false
     @State private var showingEditWidget: Widget?
-    @State private var widgets: [Widget] = []
     @State private var lastKnownDeviceIds: Set<String> = []
+    
+    // Computed property to get widgets directly from dashboard
+    // This ensures widgets are always up-to-date and don't get lost when view is recreated
+    private var widgets: [Widget] {
+        dashboard.widgets ?? []
+    }
     
     // Grid configuration: 4 columns (quarter width = 1 column, half width = 2 columns, full width = 4 columns)
     private let columns = [
@@ -29,13 +34,13 @@ struct DashboardDetailView: View {
     ]
     
     var body: some View {
-        GeometryReader { geometry in
-            let screenWidth = geometry.size.width
+        return GeometryReader { geometry in
+            let screenWidth = max(geometry.size.width, 100) // Ensure minimum width to prevent negative values
             let padding: CGFloat = 16
             let spacing: CGFloat = 16
-            let quarterWidth = (screenWidth - padding * 2 - spacing * 3) / 4
-            let halfWidth = (screenWidth - padding * 2 - spacing) / 2
-            let fullWidth = screenWidth - padding * 2
+            let quarterWidth = max((screenWidth - padding * 2 - spacing * 3) / 4, 50) // Ensure minimum width
+            let halfWidth = max((screenWidth - padding * 2 - spacing) / 2, 100) // Ensure minimum width
+            let fullWidth = max(screenWidth - padding * 2, 200) // Ensure minimum width
             
             ScrollView {
                 VStack(alignment: .leading, spacing: spacing) {
@@ -69,9 +74,32 @@ struct DashboardDetailView: View {
         .sheet(item: $showingEditWidget) { widget in
             EditWidgetView(dashboard: dashboard, widget: widget)
         }
-        .onAppear {
-            loadWidgets()
+        .task {
+            // CRITICAL: This runs BEFORE the view is rendered (via .task)
+            // First, restore telemetry data for online devices if MQTT is already connected
+            // This preserves widget values when returning to the dashboard
+            // MUST happen BEFORE verifyDeviceStatus() to prevent data deletion
+            if case .connected = mqttViewModel.connectionState {
+                // Get all devices in this dashboard that are currently online
+                let dashboardDeviceIds = Set(dashboard.deviceIds)
+                let onlineDevices = devices.filter { dashboardDeviceIds.contains($0.id) && $0.isOnline }
+                let onlineDeviceIds = onlineDevices.map { $0.id }
+                
+                // Check if any online devices are missing telemetry data
+                let devicesNeedingRestore = onlineDeviceIds.filter { deviceId in
+                    mqttViewModel.latestTelemetryData[deviceId] == nil || mqttViewModel.latestTelemetryData[deviceId]?.isEmpty == true
+                }
+                
+                if !devicesNeedingRestore.isEmpty {
+                    mqttViewModel.restoreTelemetryDataForDevices(deviceIds: devicesNeedingRestore)
+                }
+            }
             
+            // Now verify device status AFTER data restoration
+            // This ensures that devices with restored data are not incorrectly marked as offline
+            await verifyDeviceStatus()
+        }
+        .onAppear {
             // Check if device list has changed
             let currentDeviceIds = Set(dashboard.deviceIds)
             
@@ -87,20 +115,24 @@ struct DashboardDetailView: View {
                 lastKnownDeviceIds = currentDeviceIds
                 autoConnectMQTT()
             } else {
-                // Device list unchanged - only connect if not connected, and check for new devices
-                ensureMQTTConnected()
-                
-                // Check if there are new devices that need to be subscribed
-                // This ensures that if a device was added while the dashboard was not active,
-                // it will be subscribed when the dashboard becomes active again
-                // Wait a bit for the connection to be established before checking
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    self.checkAndSubscribeToNewDevices()
+                // Device list unchanged
+                // CRITICAL: Only connect if not connected - if already connected, do nothing
+                // This prevents unnecessary reconnects that clear telemetry data
+                if case .connected = mqttViewModel.connectionState {
+                    // Already connected - nothing to do, just check for new devices to subscribe
+                    // This ensures that if a device was added while the dashboard was not active,
+                    // it will be subscribed when the dashboard becomes active again
+                    checkAndSubscribeToNewDevices()
+                } else {
+                    // Not connected - connect and then subscribe
+                    ensureMQTTConnected()
+                    
+                    // Wait a bit for the connection to be established before checking
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        self.checkAndSubscribeToNewDevices()
+                    }
                 }
             }
-        }
-        .onChange(of: dashboard.widgets) { _, _ in
-            loadWidgets()
         }
         .onChange(of: dashboard.deviceIds) { oldIds, newIds in
             // Device list changed - update lastKnownDeviceIds and trigger refresh
@@ -118,8 +150,78 @@ struct DashboardDetailView: View {
         }
     }
     
-    private func loadWidgets() {
-        widgets = dashboard.widgets ?? []
+    
+    @MainActor
+    private func verifyDeviceStatus() async {
+        // CRITICAL: This runs BEFORE the view is rendered (via .task)
+        // Verify device status to ensure only devices with current messages are online
+        // This prevents devices from being incorrectly shown as online when the view first appears
+        let dashboardDeviceIds = Set(dashboard.deviceIds)
+        let dashboardDevices = devices.filter { dashboardDeviceIds.contains($0.id) }
+        
+        // CRITICAL: Only verify device status if MQTT is connected
+        // If MQTT is not connected, we can't determine device status accurately
+        // and we should NOT delete data, as it may be restored when MQTT reconnects
+        guard case .connected = mqttViewModel.connectionState else {
+            return
+        }
+        
+        // Check which devices have current messages in latestTelemetryData
+        let devicesWithMessages = Set(mqttViewModel.latestTelemetryData.keys)
+        
+        var statusChanged = false
+        
+        for device in dashboardDevices {
+            let hasCurrentMessages = devicesWithMessages.contains(device.id)
+            
+            if !hasCurrentMessages {
+                // Device has no current messages - it's truly offline
+                // Mark as offline and clean up its data
+                if device.isOnline {
+                    device.isOnline = false
+                    statusChanged = true
+                }
+                if device.lastSeen != nil {
+                    device.lastSeen = nil
+                    statusChanged = true
+                }
+                // CRITICAL: Remove in-memory telemetry data only for offline devices
+                mqttViewModel.latestTelemetryData.removeValue(forKey: device.id)
+                // CRITICAL: Delete persisted TelemetryData only for offline devices
+                deletePersistedTelemetryData(for: device.id)
+            } else {
+                // Device has current messages - it's online
+                // Verify it's marked as online (handleMessage should have done this)
+                if !device.isOnline {
+                    device.isOnline = true
+                    statusChanged = true
+                }
+                // CRITICAL: Keep all telemetry data for online devices
+                // This preserves widget values when returning to the dashboard
+                // DO NOT delete data for online devices!
+            }
+        }
+        
+        if statusChanged {
+            try? modelContext.save()
+            NotificationCenter.default.post(name: NSNotification.Name("DeviceStatusUpdated"), object: nil)
+        }
+    }
+    
+    /// Deletes all TelemetryData objects from SwiftData for a specific device
+    private func deletePersistedTelemetryData(for deviceId: String) {
+        let descriptor = FetchDescriptor<TelemetryData>(
+            predicate: #Predicate<TelemetryData> { data in
+                data.deviceId == deviceId
+            }
+        )
+        
+        if let telemetryData = try? modelContext.fetch(descriptor) {
+            for data in telemetryData {
+                modelContext.delete(data)
+            }
+            try? modelContext.save()
+        }
     }
     
     // Gruppiere Widgets in Zeilen für korrekte Anordnung
@@ -214,7 +316,10 @@ struct DashboardDetailView: View {
             
             if shouldStartNewRow {
                 if !currentRow.isEmpty {
-                    rows.append(WidgetRow(id: UUID(), widgets: currentRow, columnPositions: columnPositions))
+                    // Generate stable ID based on first widget ID to prevent unnecessary re-renders
+                    // This ensures the row ID stays the same as long as widgets don't change
+                    let rowId = currentRow.first?.id ?? UUID()
+                    rows.append(WidgetRow(id: rowId, widgets: currentRow, columnPositions: columnPositions))
                 }
                 currentRow = [widget]
                 // Reset column positions for new row
@@ -249,7 +354,10 @@ struct DashboardDetailView: View {
         
         // Füge die letzte Zeile hinzu
         if !currentRow.isEmpty {
-            rows.append(WidgetRow(id: UUID(), widgets: currentRow, columnPositions: columnPositions))
+            // Generate stable ID based on first widget ID to prevent unnecessary re-renders
+            // This ensures the row ID stays the same as long as widgets don't change
+            let rowId = currentRow.first?.id ?? UUID()
+            rows.append(WidgetRow(id: rowId, widgets: currentRow, columnPositions: columnPositions))
         }
         
         return rows
@@ -304,6 +412,7 @@ struct DashboardDetailView: View {
                                 fullWidth: fullWidth,
                                 spacing: spacing
                             )
+                            .id("\(widget.id)-\(widget.deviceId)-\(widget.telemetryKeyword)")
                         }
                     }
                 }
@@ -465,32 +574,36 @@ struct DashboardDetailView: View {
     
     private func ensureMQTTConnected() {
         // Only connect if not already connected - no disconnect/reconnect cycle
-        guard case .connected = mqttViewModel.connectionState else {
-            // Not connected - try to connect
-            guard let settings = brokerSettings.first, !settings.host.isEmpty else {
-                return
-            }
-            
-            // Connect without disconnecting first (lightweight connection)
-            let connected = mqttViewModel.connect(brokerSettings: settings)
-            
-            if connected {
-                // Wait for connection, then subscribe to new devices only
-                Task { @MainActor in
-                    var attempts = 0
-                    while case .connecting = mqttViewModel.connectionState, attempts < 20 {
-                        try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
-                        attempts += 1
-                    }
+        if case .connected = mqttViewModel.connectionState {
+            // Already connected - nothing to do
+            // Device status is managed entirely by handleMessage() in MqttViewModel
+            return
+        }
+        
+        // Not connected - try to connect
+        guard let settings = brokerSettings.first, !settings.host.isEmpty else {
+            return
+        }
+        
+        // Connect without disconnecting first (lightweight connection)
+        let connected = mqttViewModel.connect(brokerSettings: settings)
+        
+        if connected {
+            // Wait for connection, then subscribe to new devices only
+            Task { @MainActor in
+                var attempts = 0
+                while case .connecting = mqttViewModel.connectionState, attempts < 20 {
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+                    attempts += 1
+                }
+                
+                // Check if connected and subscribe to devices in this dashboard
+                if case .connected = mqttViewModel.connectionState {
+                    let keywords = telemetryConfigs.first?.keywords ?? []
+                    let dashboardDevices = devices.filter { dashboard.deviceIds.contains($0.id) }
                     
-                    // Check if connected and subscribe to devices in this dashboard
-                    if case .connected = mqttViewModel.connectionState {
-                        let keywords = telemetryConfigs.first?.keywords ?? []
-                        let dashboardDevices = devices.filter { dashboard.deviceIds.contains($0.id) }
-                        
-                        if !dashboardDevices.isEmpty {
-                            mqttViewModel.subscribeToAllDevices(devices: dashboardDevices, telemetryKeywords: keywords)
-                        }
+                    if !dashboardDevices.isEmpty {
+                        mqttViewModel.subscribeToAllDevices(devices: dashboardDevices, telemetryKeywords: keywords)
                     }
                 }
             }
@@ -611,7 +724,6 @@ struct DashboardDetailView: View {
         withAnimation {
             dashboard.widgets?.removeAll { $0.id == widget.id }
             modelContext.delete(widget)
-            loadWidgets()
         }
     }
     
@@ -843,6 +955,8 @@ struct AddWidgetView: View {
                                 Text(mode.rawValue).tag(PinMode?.some(mode))
                             }
                         }
+                        
+                        Toggle("Inverted Logic", isOn: $invertedLogic)
                     }
                 }
                 
@@ -873,6 +987,8 @@ struct AddWidgetView: View {
                                 Text(mode.rawValue).tag(PinMode?.some(mode))
                             }
                         }
+                        
+                        Toggle("Inverted Logic", isOn: $invertedLogic)
                         
                         TextField("Press Duration (ms, default: 100)", text: $buttonDuration)
                             .keyboardType(.numberPad)
@@ -1208,6 +1324,8 @@ struct EditWidgetView: View {
                                 Text(mode.rawValue).tag(PinMode?.some(mode))
                             }
                         }
+                        
+                        Toggle("Inverted Logic", isOn: $invertedLogic)
                     }
                 }
                 
@@ -1238,6 +1356,8 @@ struct EditWidgetView: View {
                                 Text(mode.rawValue).tag(PinMode?.some(mode))
                             }
                         }
+                        
+                        Toggle("Inverted Logic", isOn: $invertedLogic)
                         
                         TextField("Press Duration (ms, default: 100)", text: $buttonDuration)
                             .keyboardType(.numberPad)

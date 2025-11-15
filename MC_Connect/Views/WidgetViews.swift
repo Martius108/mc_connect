@@ -210,8 +210,19 @@ struct SwitchWidget: View {
         guard !isUpdatingFromTelemetry else { return }
         
         if let value = value {
-            // Treat any non-zero value as "on"
-            let newState = value != 0.0
+            // Treat any non-zero value as HIGH (1), zero as LOW (0)
+            let gpioValue = value != 0.0
+            
+            // Apply inverted logic if enabled
+            // If inverted: LOW (0) means ON (true), HIGH (1) means OFF (false)
+            // If not inverted: HIGH (1) means ON (true), LOW (0) means OFF (false)
+            let newState: Bool
+            if widget.invertedLogic {
+                newState = !gpioValue  // Inverted: LOW = ON, HIGH = OFF
+            } else {
+                newState = gpioValue   // Normal: HIGH = ON, LOW = OFF
+            }
+            
             // Nur aktualisieren, wenn sich der State tatsächlich geändert hat
             if isOn != newState {
                 isUpdatingFromTelemetry = true
@@ -239,10 +250,20 @@ struct SwitchWidget: View {
         // Payload format: {"type": "gpio", "pin": X, "value": 0|1, "mode": "output"}
         let topic = "device/\(widget.deviceId)/command"
         
+        // Apply inverted logic if enabled
+        // If inverted: ON (true) sends LOW (0), OFF (false) sends HIGH (1)
+        // If not inverted: ON (true) sends HIGH (1), OFF (false) sends LOW (0)
+        let gpioValue: Int
+        if widget.invertedLogic {
+            gpioValue = state ? 0 : 1
+        } else {
+            gpioValue = state ? 1 : 0
+        }
+        
         // Create standardized GPIO command
         let command = CommandFactory.createGpioCommand(
             pin: pin,
-            value: state ? 1 : 0,
+            value: gpioValue,
             mode: widget.mode?.rawValue.lowercased()
         )
         
@@ -874,8 +895,17 @@ struct ButtonWidget: View {
     
     private var currentState: Bool {
         if let value = value {
-            // Treat any non-zero value as "on"
-            return value != 0.0
+            // Treat any non-zero value as HIGH (1), zero as LOW (0)
+            let gpioValue = value != 0.0
+            
+            // Apply inverted logic if enabled
+            // If inverted: LOW (0) means active (true), HIGH (1) means inactive (false)
+            // If not inverted: HIGH (1) means active (true), LOW (0) means inactive (false)
+            if widget.invertedLogic {
+                return !gpioValue  // Inverted: LOW = active, HIGH = inactive
+            } else {
+                return gpioValue   // Normal: HIGH = active, LOW = inactive
+            }
         }
         return false
     }
@@ -933,13 +963,19 @@ struct ButtonWidget: View {
         isProcessing = true
         isPressed = true
         
-        // Send HIGH command
-        sendButtonCommand(pin: pin, value: 1)
+        // Apply inverted logic if enabled
+        // If inverted: First send LOW (0), then HIGH (1)
+        // If not inverted: First send HIGH (1), then LOW (0)
+        let firstValue: Int = widget.invertedLogic ? 0 : 1
+        let secondValue: Int = widget.invertedLogic ? 1 : 0
         
-        // After duration, send LOW command
+        // Send first command
+        sendButtonCommand(pin: pin, value: firstValue)
+        
+        // After duration, send second command
         let durationInSeconds = buttonDuration / 1000.0
         DispatchQueue.main.asyncAfter(deadline: .now() + durationInSeconds) {
-            sendButtonCommand(pin: pin, value: 0)
+            sendButtonCommand(pin: pin, value: secondValue)
             isPressed = false
             isProcessing = false
         }
@@ -969,6 +1005,11 @@ struct ButtonWidget: View {
 struct UniversalWidgetView: View {
     let widget: Widget
     @ObservedObject var mqttViewModel: MqttViewModel
+    
+    // Stable identity for the view to prevent unnecessary re-creation
+    private var viewId: String {
+        "\(widget.id)-\(widget.deviceId)-\(widget.telemetryKeyword)"
+    }
     
     // Computed properties that access the @Published property directly
     // This ensures SwiftUI observes changes to the telemetry data

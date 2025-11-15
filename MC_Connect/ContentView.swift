@@ -11,6 +11,10 @@ import SwiftData
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @StateObject private var mqttViewModel = MqttViewModel()
+    @Environment(\.scenePhase) private var scenePhase
+    @Query private var brokerSettings: [BrokerSettings]
+    @Query private var dashboards: [Dashboard]
+    @Query private var devices: [Device]
 
     var body: some View {
         TabView {
@@ -43,6 +47,44 @@ struct ContentView: View {
                 mqttViewModel.setAllDevicesOffline()
             }
         }
+        .onChange(of: scenePhase) { oldPhase, newPhase in
+            // Automatically reconnect MQTT when app becomes active from background
+            if oldPhase == .background && newPhase == .active {
+                handleAppBecameActive()
+            }
+        }
+    }
+    
+    private func handleAppBecameActive() {
+        // Check if we have valid broker settings
+        guard let settings = brokerSettings.first,
+              !settings.host.isEmpty else {
+            return
+        }
+        
+        // Check if there are any devices to monitor
+        // Only reconnect if there are devices to monitor
+        let hasDevicesInDashboards = dashboards.contains { dashboard in
+            !dashboard.deviceIds.isEmpty && 
+            dashboard.deviceIds.contains { deviceId in
+                devices.contains { $0.id == deviceId }
+            }
+        }
+        
+        // Also check if there are any devices at all
+        let hasAnyDevices = !devices.isEmpty
+        
+        guard hasDevicesInDashboards || hasAnyDevices else {
+            return
+        }
+        
+        // Attempt to reconnect MQTT if needed
+        // This will handle the reconnection directly, even if no dashboard is open
+        mqttViewModel.attemptReconnectIfNeeded(brokerSettings: settings)
+        
+        // Also post notification to trigger reconnection in DashboardDetailView
+        // This ensures that if a dashboard is open, it will also handle the reconnection
+        NotificationCenter.default.post(name: NSNotification.Name("ReconnectMQTT"), object: nil)
     }
 }
 

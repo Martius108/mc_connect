@@ -40,7 +40,20 @@ class MqttService: MqttServiceProtocol, ObservableObject {
             return false
         }
         
-        // Disconnect existing connection if any
+        // IMPORTANT: If already connected with the same configuration, don't reconnect
+        // This prevents unnecessary disconnection/reconnection cycles when switching tabs
+        if mqttClient != nil,
+           case .connected = connectionState.value,
+           let existingConfig = configuration,
+           existingConfig.host == config.host &&
+           existingConfig.port == config.port &&
+           existingConfig.username == config.username &&
+           existingConfig.password == config.password {
+            // Already connected with same settings - nothing to do
+            return true
+        }
+        
+        // Disconnect existing connection if any (different config or not connected)
         if let existingClient = mqttClient {
             existingClient.disconnect()
             // Clear subscribed topics when disconnecting

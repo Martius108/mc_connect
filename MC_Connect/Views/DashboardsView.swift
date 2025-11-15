@@ -77,6 +77,7 @@ struct DashboardsView: View {
 struct DashboardRow: View {
     let dashboard: Dashboard
     let devices: [Device]
+    @State private var refreshID = UUID()
     
     var dashboardDevices: [Device] {
         devices.filter { dashboard.deviceIds.contains($0.id) }
@@ -98,6 +99,7 @@ struct DashboardRow: View {
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
+                        .id("\(device.id)-\(device.isOnline)-\(refreshID)")
                     }
                     if dashboardDevices.count > 3 {
                         Text("+\(dashboardDevices.count - 3) more")
@@ -112,6 +114,9 @@ struct DashboardRow: View {
             }
         }
         .padding(.vertical, 4)
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("DeviceStatusUpdated"))) { _ in
+            refreshID = UUID()
+        }
     }
 }
 

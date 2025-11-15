@@ -41,42 +41,92 @@ class MqttViewModel: ObservableObject {
         // Subscribe to connection state changes
         mqttService.connectionState
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] state in
-                self?.connectionState = state
+            .sink { [weak self] newState in
+                guard let self = self else { return }
+                
+                // CRITICAL: Save previous state BEFORE updating
+                let previousState = self.connectionState
+                
+                self.connectionState = newState
                 
                 // If we were disconnected unexpectedly (error or disconnect), 
                 // set all devices to offline
-                if case .disconnected = state {
-                    self?.setAllDevicesOffline()
-                } else if case .error = state {
-                    self?.setAllDevicesOffline()
+                if case .disconnected = newState {
+                    self.setAllDevicesOffline()
+                } else if case .error = newState {
+                    self.setAllDevicesOffline()
                 }
                 
-                // If we were disconnected unexpectedly (error or disconnect), 
-                // we need to resubscribe when reconnected
-                // Note: DashboardDetailView will handle manual resubscription, 
-                // but we keep this as a backup in case of unexpected disconnects
-                if case .connected = state {
-                    // Auto-resubscribe if we had previous subscriptions and no manual subscription is in progress
-                    // IMPORTANT: Wait longer to ensure DashboardDetailView has time to subscribe first
-                    guard let strongSelf = self,
-                          !strongSelf.subscribedDevices.isEmpty,
-                          !strongSelf.isSubscribing else {
+                // CRITICAL: When MQTT connects, reset ALL devices to offline first
+                // This ensures that devices are only marked as online when they actually send messages
+                // This prevents devices from remaining online from a previous session
+                if case .connected = newState {
+                    // CRITICAL: Check if this is a NEW connection or a RE-connection
+                    // If MQTT was already connected (we have data), this is just a state update
+                    // and we should NOT clear the data to preserve widget values
+                    let wasAlreadyConnected: Bool
+                    if case .connected = previousState {
+                        wasAlreadyConnected = true
+                    } else {
+                        wasAlreadyConnected = false
+                    }
+                    let hasExistingData = !self.latestTelemetryData.isEmpty
+                    
+                    if wasAlreadyConnected && hasExistingData {
+                        // MQTT was already connected and we have data - this is just a state update
+                        // Do NOT clear data to preserve widget values when navigating between views
                         return
                     }
                     
-                    Task { @MainActor in
-                        // Wait longer (2s) to ensure DashboardDetailView has time to subscribe first
-                        try? await Task.sleep(nanoseconds: 2_000_000_000)
-                        // Only auto-resubscribe if DashboardDetailView hasn't done it yet
-                        guard let strongSelf = self,
-                              !strongSelf.subscribedDevices.isEmpty,
-                              !strongSelf.isSubscribing else {
+                    // CRITICAL: Only clear data if it's empty OR if we're coming from a disconnected state
+                    // AND there's no existing data. This preserves widget values when MQTT reconnects
+                    // while devices are still online and sending data.
+                    // If data already exists, it means devices are actively sending, so preserve it.
+                    if hasExistingData {
+                        // Data exists - devices are actively sending, preserve the data
+                        // Still reset subscribed devices list to prevent conflicts
+                        self.subscribedDevices.removeAll()
+                        self.subscribedKeywords.removeAll()
+                        return
+                    }
+                    
+                    // This is a NEW connection with NO existing data
+                    // CRITICAL: Before clearing data, check if there are online devices that might have data in SwiftData
+                    // If so, restore their data first to preserve widget values
+                    guard let context = self.modelContext else { return }
+                    let deviceDescriptor = FetchDescriptor<Device>()
+                    guard let allDevices = try? context.fetch(deviceDescriptor) else { return }
+                    let previouslyOnlineDeviceIds = allDevices.filter { $0.isOnline }.map { $0.id }
+                    
+                    // CRITICAL: If there are online devices, restore their data from SwiftData BEFORE clearing
+                    // This preserves widget values when MQTT reconnects while devices are still online
+                    if !previouslyOnlineDeviceIds.isEmpty {
+                        self.restoreTelemetryDataForDevices(deviceIds: previouslyOnlineDeviceIds)
+                        
+                        // After restoring, check if we now have data
+                        let hasDataAfterRestore = !self.latestTelemetryData.isEmpty
+                        if hasDataAfterRestore {
+                            // Data was restored - preserve it and don't clear
+                            // Still reset subscribed devices list to prevent conflicts
+                            self.subscribedDevices.removeAll()
+                            self.subscribedKeywords.removeAll()
                             return
                         }
-                        
-                        strongSelf.subscribeToAllDevices(devices: strongSelf.subscribedDevices, telemetryKeywords: strongSelf.subscribedKeywords)
                     }
+                    
+                    // No data could be restored - this is a true fresh connection
+                    // Clear data and reset devices
+                    self.latestTelemetryData.removeAll()
+                    
+                    // Reset all devices to offline when connecting
+                    // Devices will be marked as online only when they send messages
+                    self.setAllDevicesOffline()
+                    
+                    // CRITICAL: Clear subscribed devices list to prevent auto-resubscription
+                    // DashboardDetailView will handle subscriptions manually
+                    // This prevents devices from being incorrectly marked as online
+                    self.subscribedDevices.removeAll()
+                    self.subscribedKeywords.removeAll()
                 }
             }
             .store(in: &cancellables)
@@ -125,6 +175,10 @@ class MqttViewModel: ObservableObject {
     func disconnect() {
         mqttService.disconnect()
         stopOfflineCheckTimer()
+        // IMPORTANT: Don't clear telemetry data when disconnecting
+        // This allows data to persist when switching tabs or temporarily disconnecting
+        // Data will only be cleared on a fresh connection (in setupSubscriptions)
+        // latestTelemetryData.removeAll() // Removed to preserve data across tab switches
     }
     
     private func startOfflineCheckTimer() {
@@ -145,23 +199,63 @@ class MqttViewModel: ObservableObject {
     private func checkDeviceOfflineStatus() async {
         guard let context = modelContext else { return }
         
+        // Only check if MQTT is connected - if disconnected, devices should already be offline
+        guard case .connected = connectionState else {
+            return
+        }
+        
         let descriptor = FetchDescriptor<Device>()
         guard let devices = try? context.fetch(descriptor) else { return }
         
         let now = Date()
+        let devicesWithMessages = Set(latestTelemetryData.keys)
         var statusChanged = false
         for device in devices {
-            if let lastSeen = device.lastSeen {
-                let timeSinceLastSeen = now.timeIntervalSince(lastSeen)
-                if timeSinceLastSeen > offlineTimeout && device.isOnline {
+            // CRITICAL: A device can only be online if:
+            // 1. It has sent a message (has lastSeen)
+            // 2. It has current telemetry data in latestTelemetryData
+            // 3. The last message was within the timeout period
+            
+            if device.isOnline {
+                // Check if device has current telemetry data
+                let hasCurrentData = devicesWithMessages.contains(device.id)
+                
+                if !hasCurrentData {
+                    // Device is marked as online but has no current telemetry data
+                    // This means it's not sending messages - mark as offline immediately
                     device.isOnline = false
+                    device.lastSeen = nil
+                    // CRITICAL: Remove in-memory telemetry data
+                    latestTelemetryData.removeValue(forKey: device.id)
+                    // CRITICAL: Delete all persisted TelemetryData from SwiftData
+                    deletePersistedTelemetryData(for: device.id)
+                    statusChanged = true
+                } else if let lastSeen = device.lastSeen {
+                    // Device has sent messages - check if it's been too long
+                    let timeSinceLastSeen = now.timeIntervalSince(lastSeen)
+                    if timeSinceLastSeen > offlineTimeout {
+                        // Too long since last message - mark as offline
+                        device.isOnline = false
+                        device.lastSeen = nil
+                        // CRITICAL: Remove in-memory telemetry data
+                        latestTelemetryData.removeValue(forKey: device.id)
+                        // CRITICAL: Delete all persisted TelemetryData from SwiftData
+                        deletePersistedTelemetryData(for: device.id)
+                        statusChanged = true
+                    }
+                } else {
+                    // Device is marked as online but has never sent a message (lastSeen is nil)
+                    // This should never happen, but if it does, mark as offline immediately
+                    device.isOnline = false
+                    // CRITICAL: Remove in-memory telemetry data
+                    latestTelemetryData.removeValue(forKey: device.id)
+                    // CRITICAL: Delete all persisted TelemetryData from SwiftData
+                    deletePersistedTelemetryData(for: device.id)
                     statusChanged = true
                 }
-            } else if device.isOnline {
-                // Device was never seen but marked as online - mark as offline
-                device.isOnline = false
-                statusChanged = true
             }
+            // Note: We don't mark devices as online here - they can only be marked as online
+            // when they actually send messages (in handleMessage -> updateDeviceLastSeen)
         }
         
         if statusChanged {
@@ -193,8 +287,9 @@ class MqttViewModel: ObservableObject {
         
         isSubscribing = true
         
-        // Remove data only for devices that are NOT in the new subscription list
-        // Keep existing data for devices that are being resubscribed
+        // CRITICAL: Remove data for devices that are NOT in the new subscription list
+        // AND remove data for devices that are in the subscription list but haven't sent messages recently
+        // This ensures that only devices actively sending messages have data
         let deviceIdsToSubscribe = Set(devices.map { $0.id })
         let existingDeviceIds = Set(latestTelemetryData.keys)
         
@@ -204,6 +299,12 @@ class MqttViewModel: ObservableObject {
                 latestTelemetryData.removeValue(forKey: deviceId)
             }
         }
+        
+        // CRITICAL: For devices in the subscription list, verify they have current data
+        // If a device is subscribed but has no recent messages, remove its old data
+        // This prevents stale data from causing incorrect device status
+        // Note: We don't remove data here if the device is subscribed - we let the
+        // offline check timer and DashboardDetailView handle that to avoid race conditions
         
         // Subscribe to all devices sequentially to avoid conflicts
         Task { @MainActor in
@@ -237,11 +338,28 @@ class MqttViewModel: ObservableObject {
     private func handleMessage(_ message: MqttMessage) {
         let (deviceId, keyword) = message.parseTopic()
         
+        // CRITICAL: Validate device ID and keyword before processing
+        // This ensures we only process messages from valid devices
         guard let deviceId = deviceId,
               let keyword = keyword,
               !deviceId.isEmpty,
               !keyword.isEmpty else {
             // Invalid topic format - skip this message
+            // This prevents processing messages with malformed topics
+            return
+        }
+        
+        // CRITICAL: Verify that the device exists in the database before updating status
+        // This prevents updating status for non-existent devices
+        guard let context = modelContext else { return }
+        let deviceDescriptor = FetchDescriptor<Device>(
+            predicate: #Predicate<Device> { device in
+                device.id == deviceId
+            }
+        )
+        guard let _ = try? context.fetch(deviceDescriptor).first else {
+            // Device not found - skip this message
+            // This prevents updating status for devices that don't exist
             return
         }
         
@@ -375,27 +493,48 @@ class MqttViewModel: ObservableObject {
     private func updateDeviceStatus(deviceId: String, isOnline: Bool, updateLastSeen: Bool = true) {
         guard let context = modelContext else { return }
         
+        // CRITICAL: Use exact match predicate to ensure we only update the specific device
+        // This prevents accidentally updating multiple devices
         let descriptor = FetchDescriptor<Device>(
-            predicate: #Predicate { $0.id == deviceId }
+            predicate: #Predicate<Device> { device in
+                device.id == deviceId
+            }
         )
         
-        if let device = try? context.fetch(descriptor).first {
-            let statusChanged = device.isOnline != isOnline
-            device.isOnline = isOnline
-            if updateLastSeen {
-                device.lastSeen = Date()
+        // CRITICAL: Only update the first matching device (should be exactly one)
+        // This ensures we don't accidentally update multiple devices with the same ID
+        guard let device = try? context.fetch(descriptor).first else {
+            // Device not found - this is fine, just return
+            return
+        }
+        
+        // CRITICAL: Double-check that we have the correct device before updating
+        guard device.id == deviceId else {
+            // Device ID mismatch - this should never happen
+            return
+        }
+        
+        // CRITICAL: Only update if status actually changes to avoid unnecessary saves
+        let statusChanged = device.isOnline != isOnline
+        
+        // Update status
+        device.isOnline = isOnline
+        
+        // Update lastSeen timestamp
+        if updateLastSeen {
+            device.lastSeen = Date()
+        }
+        
+        // Force save to ensure SwiftData updates
+        do {
+            try context.save()
+            // Only notify if status actually changed (not just lastSeen update)
+            // This reduces unnecessary UI updates
+            if statusChanged {
+                NotificationCenter.default.post(name: NSNotification.Name("DeviceStatusUpdated"), object: nil)
             }
-            
-            // Force save to ensure SwiftData updates
-            do {
-                try context.save()
-                // Always notify views to refresh when status changes or last seen updates
-                if statusChanged || updateLastSeen {
-                    NotificationCenter.default.post(name: NSNotification.Name("DeviceStatusUpdated"), object: nil)
-                }
-            } catch {
-                // Failed to save device status
-            }
+        } catch {
+            // Failed to save device status - silently continue
         }
     }
     
@@ -406,6 +545,76 @@ class MqttViewModel: ObservableObject {
     func getAllTelemetryForDevice(deviceId: String) -> [String: TelemetryData] {
         return latestTelemetryData[deviceId] ?? [:]
     }
+    
+    /// Deletes all TelemetryData objects from SwiftData for a specific device
+    /// This ensures that when a device goes offline, all its persisted data is removed
+    private func deletePersistedTelemetryData(for deviceId: String) {
+        guard let context = modelContext else { return }
+        
+        let descriptor = FetchDescriptor<TelemetryData>(
+            predicate: #Predicate<TelemetryData> { data in
+                data.deviceId == deviceId
+            }
+        )
+        
+        if let telemetryData = try? context.fetch(descriptor) {
+            for data in telemetryData {
+                context.delete(data)
+            }
+            try? context.save()
+        }
+    }
+    
+    /// Deletes all TelemetryData objects from SwiftData for multiple devices
+    private func deletePersistedTelemetryData(for deviceIds: [String]) {
+        guard modelContext != nil else { return }
+        
+        for deviceId in deviceIds {
+            deletePersistedTelemetryData(for: deviceId)
+        }
+    }
+    
+    /// Restores telemetry data from SwiftData for specific devices
+    /// This preserves widget values when MQTT reconnects while devices are still online
+    func restoreTelemetryDataForDevices(deviceIds: [String]) {
+        guard let context = modelContext else { return }
+        
+        var restoredCount = 0
+        
+        // For each device, restore its telemetry data from SwiftData
+        for deviceId in deviceIds {
+            let telemetryDescriptor = FetchDescriptor<TelemetryData>(
+                predicate: #Predicate<TelemetryData> { data in
+                    data.deviceId == deviceId
+                },
+                sortBy: [SortDescriptor(\TelemetryData.timestamp, order: .reverse)]
+            )
+            
+            guard let telemetryData = try? context.fetch(telemetryDescriptor) else {
+                continue
+            }
+            
+            // Group by keyword and take the most recent for each keyword
+            var deviceData: [String: TelemetryData] = [:]
+            for data in telemetryData {
+                if deviceData[data.keyword] == nil {
+                    // Take the first (most recent) entry for each keyword
+                    deviceData[data.keyword] = data
+                }
+            }
+            
+            // Restore to in-memory dictionary
+            if !deviceData.isEmpty {
+                latestTelemetryData[deviceId] = deviceData
+                restoredCount += 1
+            }
+        }
+        
+        if restoredCount > 0 {
+            objectWillChange.send()
+        }
+    }
+    
     
     private func addToLog(topic: String, payload: String) {
         let entry = PayloadLogEntry(topic: topic, payload: payload, timestamp: Date())
@@ -435,16 +644,87 @@ class MqttViewModel: ObservableObject {
         guard let devices = try? context.fetch(descriptor) else { return }
         
         var statusChanged = false
+        
         for device in devices {
+            // CRITICAL: Mark device as offline AND reset lastSeen
+            // This ensures that devices are only marked as online when they actually send messages
+            // Resetting lastSeen is important because it prevents devices from being incorrectly
+            // marked as online based on stale lastSeen timestamps
             if device.isOnline {
                 device.isOnline = false
                 statusChanged = true
             }
+            // Always reset lastSeen when setting all devices offline
+            // This ensures a clean state when MQTT connects
+            device.lastSeen = nil
         }
+        
+        // CRITICAL: Remove all in-memory telemetry data
+        // NOTE: We do NOT delete persisted TelemetryData here, as it may be needed
+        // to restore widget values when MQTT reconnects. Persisted data will be
+        // cleaned up by checkDeviceOfflineStatus() and verifyDeviceStatus() when
+        // devices are confirmed to be offline.
+        latestTelemetryData.removeAll()
         
         if statusChanged {
             try? context.save()
             NotificationCenter.default.post(name: NSNotification.Name("DeviceStatusUpdated"), object: nil)
+        } else {
+            // Even if no status changed, save to persist lastSeen = nil
+            try? context.save()
+        }
+    }
+    
+    
+    /// Attempts to reconnect MQTT if disconnected, using devices and telemetry config from SwiftData
+    /// This is useful when the app becomes active from background
+    func attemptReconnectIfNeeded(brokerSettings: BrokerSettings) {
+        // Only reconnect if currently disconnected or in error state
+        let shouldReconnect: Bool
+        switch connectionState {
+        case .disconnected, .error:
+            shouldReconnect = true
+        case .connecting, .connected:
+            shouldReconnect = false
+        }
+        
+        guard shouldReconnect else {
+            return
+        }
+        
+        // Check if we have valid broker settings
+        guard !brokerSettings.host.isEmpty else {
+            return
+        }
+        
+        // Connect to MQTT
+        let connected = connect(brokerSettings: brokerSettings)
+        
+        if connected {
+            // Wait for connection, then subscribe to all devices
+            Task { @MainActor in
+                var attempts = 0
+                while case .connecting = connectionState, attempts < 20 {
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+                    attempts += 1
+                }
+                
+                // Check if connected
+                if case .connected = connectionState {
+                    guard let context = modelContext else { return }
+                    
+                    // Load telemetry keywords
+                    let telemetryDescriptor = FetchDescriptor<TelemetryConfig>()
+                    let keywords = (try? context.fetch(telemetryDescriptor).first?.keywords) ?? []
+                    
+                    // Load all devices
+                    let deviceDescriptor = FetchDescriptor<Device>()
+                    if let allDevices = try? context.fetch(deviceDescriptor), !allDevices.isEmpty {
+                        // Subscribe to all devices
+                        subscribeToAllDevices(devices: allDevices, telemetryKeywords: keywords)
+                    }
+                }
+            }
         }
     }
 }
