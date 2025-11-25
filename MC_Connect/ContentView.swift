@@ -48,9 +48,26 @@ struct ContentView: View {
             }
         }
         .onChange(of: scenePhase) { oldPhase, newPhase in
-            // Automatically reconnect MQTT when app becomes active from background
-            if oldPhase == .background && newPhase == .active {
+            // Handle app lifecycle changes for MQTT connection
+            switch (oldPhase, newPhase) {
+            case (.active, .inactive):
+                // App is going to inactive (e.g., screen lock)
+                // Don't disconnect MQTT - let iOS handle the connection
+                // The connection may be suspended but will be restored when app becomes active
+                break
+            case (.inactive, .background):
+                // App is now in background
+                // Still don't disconnect - iOS may keep the connection alive briefly
+                break
+            case (.background, .inactive):
+                // App is coming back from background
+                break
+            case (.inactive, .active), (.background, .active):
+                // App is becoming active again (e.g., screen unlock)
+                // Check and restore MQTT connection if needed
                 handleAppBecameActive()
+            default:
+                break
             }
         }
     }
@@ -78,13 +95,27 @@ struct ContentView: View {
             return
         }
         
-        // Attempt to reconnect MQTT if needed
-        // This will handle the reconnection directly, even if no dashboard is open
-        mqttViewModel.attemptReconnectIfNeeded(brokerSettings: settings)
+        // CRITICAL: Check if MQTT is still connected after screen lock/background
+        // iOS may have suspended the connection, so we need to verify and restore if needed
+        let isConnected: Bool
+        if case .connected = mqttViewModel.connectionState {
+            isConnected = true
+        } else {
+            isConnected = false
+        }
         
-        // Also post notification to trigger reconnection in DashboardDetailView
-        // This ensures that if a dashboard is open, it will also handle the reconnection
-        NotificationCenter.default.post(name: NSNotification.Name("ReconnectMQTT"), object: nil)
+        if !isConnected {
+            // Connection was lost (likely due to iOS suspension) - attempt to reconnect
+            mqttViewModel.attemptReconnectIfNeeded(brokerSettings: settings)
+            
+            // Also post notification to trigger reconnection in DashboardDetailView
+            // This ensures that if a dashboard is open, it will also handle the reconnection
+            NotificationCenter.default.post(name: NSNotification.Name("ReconnectMQTT"), object: nil)
+        } else {
+            // Connection appears to be active - verify subscriptions are still working
+            // Post notification to let DashboardDetailView verify and restore subscriptions if needed
+            NotificationCenter.default.post(name: NSNotification.Name("VerifyMQTTConnection"), object: nil)
+        }
     }
 }
 

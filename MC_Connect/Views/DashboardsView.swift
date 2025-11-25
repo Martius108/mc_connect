@@ -123,7 +123,9 @@ struct DashboardRow: View {
 struct AddDashboardView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
-    @Query private var devices: [Device]
+    // CRITICAL: Query ALL devices, regardless of online status
+    // Dashboards should be able to include any device, online or offline
+    @Query(sort: \Device.name) private var devices: [Device]
     
     @State private var name: String = ""
     @State private var selectedDeviceIds: Set<String> = []
@@ -190,7 +192,9 @@ struct EditDashboardView: View {
     let dashboard: Dashboard
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
-    @Query private var devices: [Device]
+    // CRITICAL: Query ALL devices, regardless of online status
+    // Dashboards should be able to include any device, online or offline
+    @Query(sort: \Device.name) private var devices: [Device]
     
     @State private var name: String = ""
     @State private var selectedDeviceIds: Set<String> = []

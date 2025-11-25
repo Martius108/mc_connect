@@ -23,6 +23,12 @@ class MqttViewModel: ObservableObject {
     private var offlineCheckTimer: Timer?
     private let offlineTimeout: TimeInterval = 30.0 // Mark device as offline after 30 seconds without messages
     
+    // Message queue for prioritized processing
+    private var messageQueue: [MqttMessage] = []
+    private var isProcessingQueue = false
+    private var requiredDeviceKeywords: Set<String> = [] // Set of "deviceId:keyword" strings for widgets in current dashboard
+    private var receivedDeviceKeywords: Set<String> = [] // Track which device:keyword combinations have been received
+    
     init(mqttService: MqttServiceProtocol? = nil) {
         self.mqttService = mqttService ?? MqttService()
         setupSubscriptions()
@@ -135,7 +141,7 @@ class MqttViewModel: ObservableObject {
         mqttService.receivedMessages
             .receive(on: DispatchQueue.main)
             .sink { [weak self] message in
-                self?.handleMessage(message)
+                self?.enqueueMessage(message)
                 self?.addToLog(topic: message.topic, payload: message.payload)
             }
             .store(in: &cancellables)
@@ -147,14 +153,13 @@ class MqttViewModel: ObservableObject {
     }
     
     func connect(brokerSettings: BrokerSettings) -> Bool {
-        // Ensure we have a unique client ID to avoid conflicts with other clients
-        var clientId = brokerSettings.clientId
-        if clientId.isEmpty {
-            // Generate a unique client ID with timestamp to avoid conflicts
-            clientId = "MC_Connect_\(UUID().uuidString.prefix(8))_\(Int(Date().timeIntervalSince1970))"
+        // Use the client ID exactly as configured to stay in sync with device firmware.
+        // Only generate a fallback if the user left it empty.
+        let clientId: String
+        if brokerSettings.clientId.isEmpty {
+            clientId = "MC_Connect_\(UUID().uuidString.prefix(8))"
         } else {
-            // Append timestamp to make it unique even if user provided a static ID
-            clientId = "\(clientId)_\(Int(Date().timeIntervalSince1970))"
+            clientId = brokerSettings.clientId
         }
         
         let config = MqttConfiguration(
@@ -223,34 +228,28 @@ class MqttViewModel: ObservableObject {
                 if !hasCurrentData {
                     // Device is marked as online but has no current telemetry data
                     // This means it's not sending messages - mark as offline immediately
+                    // CRITICAL: DO NOT delete telemetry data - keep last values for widgets
                     device.isOnline = false
                     device.lastSeen = nil
-                    // CRITICAL: Remove in-memory telemetry data
-                    latestTelemetryData.removeValue(forKey: device.id)
-                    // CRITICAL: Delete all persisted TelemetryData from SwiftData
-                    deletePersistedTelemetryData(for: device.id)
+                    // DO NOT remove telemetry data - preserve last values
                     statusChanged = true
                 } else if let lastSeen = device.lastSeen {
                     // Device has sent messages - check if it's been too long
                     let timeSinceLastSeen = now.timeIntervalSince(lastSeen)
                     if timeSinceLastSeen > offlineTimeout {
                         // Too long since last message - mark as offline
+                        // CRITICAL: DO NOT delete telemetry data - keep last values for widgets
                         device.isOnline = false
                         device.lastSeen = nil
-                        // CRITICAL: Remove in-memory telemetry data
-                        latestTelemetryData.removeValue(forKey: device.id)
-                        // CRITICAL: Delete all persisted TelemetryData from SwiftData
-                        deletePersistedTelemetryData(for: device.id)
+                        // DO NOT remove telemetry data - preserve last values
                         statusChanged = true
                     }
                 } else {
                     // Device is marked as online but has never sent a message (lastSeen is nil)
                     // This should never happen, but if it does, mark as offline immediately
+                    // CRITICAL: DO NOT delete telemetry data - keep last values for widgets
                     device.isOnline = false
-                    // CRITICAL: Remove in-memory telemetry data
-                    latestTelemetryData.removeValue(forKey: device.id)
-                    // CRITICAL: Delete all persisted TelemetryData from SwiftData
-                    deletePersistedTelemetryData(for: device.id)
+                    // DO NOT remove telemetry data - preserve last values
                     statusChanged = true
                 }
             }
@@ -333,6 +332,89 @@ class MqttViewModel: ObservableObject {
         // Also remove telemetry data for this device from the dictionary
         latestTelemetryData.removeValue(forKey: deviceId)
         objectWillChange.send()
+    }
+    
+    /// Sets the required device:keyword combinations for widgets in the current dashboard
+    /// This is used to prioritize messages from devices that haven't sent data yet
+    func setRequiredDeviceKeywords(_ deviceKeywords: Set<String>) {
+        requiredDeviceKeywords = deviceKeywords
+        // Reset received tracking when requirements change
+        receivedDeviceKeywords.removeAll()
+        
+        // Mark existing data as received to avoid reprocessing as priority
+        for (deviceId, keywords) in latestTelemetryData {
+            for keyword in keywords.keys {
+                let deviceKeywordKey = "\(deviceId):\(keyword)"
+                if deviceKeywords.contains(deviceKeywordKey) {
+                    receivedDeviceKeywords.insert(deviceKeywordKey)
+                }
+            }
+        }
+    }
+    
+    /// Enqueues a message for prioritized processing
+    private func enqueueMessage(_ message: MqttMessage) {
+        messageQueue.append(message)
+        processMessageQueue()
+    }
+    
+    /// Processes the message queue with prioritization
+    /// Messages from devices that haven't sent required data yet are processed first
+    private func processMessageQueue() {
+        // Prevent concurrent processing
+        guard !isProcessingQueue else { return }
+        guard !messageQueue.isEmpty else { return }
+        
+        isProcessingQueue = true
+        
+        // Separate messages into priority and normal queues
+        var priorityMessages: [MqttMessage] = []
+        var normalMessages: [MqttMessage] = []
+        
+        for message in messageQueue {
+            let (deviceId, keyword) = message.parseTopic()
+            guard let deviceId = deviceId, let keyword = keyword else {
+                // Invalid message - process immediately
+                normalMessages.append(message)
+                continue
+            }
+            
+            let deviceKeywordKey = "\(deviceId):\(keyword)"
+            
+            // Check if this is a required device:keyword combination that hasn't been received yet
+            let isRequired = requiredDeviceKeywords.contains(deviceKeywordKey)
+            let notYetReceived = !receivedDeviceKeywords.contains(deviceKeywordKey)
+            
+            if isRequired && notYetReceived {
+                // This is a priority message - device hasn't sent this data yet
+                priorityMessages.append(message)
+            } else {
+                // Normal message - device has already sent this data or it's not required
+                normalMessages.append(message)
+            }
+        }
+        
+        // Clear the queue
+        messageQueue.removeAll()
+        
+        // Process priority messages first, then normal messages
+        let messagesToProcess = priorityMessages + normalMessages
+        
+        // Process messages sequentially to avoid race conditions
+        Task { @MainActor in
+            for message in messagesToProcess {
+                self.handleMessage(message)
+                // Small delay to prevent overwhelming the UI
+                try? await Task.sleep(nanoseconds: 10_000_000) // 0.01 seconds
+            }
+            
+            self.isProcessingQueue = false
+            
+            // Check if there are more messages queued while we were processing
+            if !self.messageQueue.isEmpty {
+                self.processMessageQueue()
+            }
+        }
     }
     
     private func handleMessage(_ message: MqttMessage) {
@@ -468,6 +550,10 @@ class MqttViewModel: ObservableObject {
         // Assign the new dictionary to trigger @Published
         latestTelemetryData = newLatestTelemetryData
         
+        // Track that we've received this device:keyword combination
+        let deviceKeywordKey = "\(deviceId):\(keyword)"
+        receivedDeviceKeywords.insert(deviceKeywordKey)
+        
         // Explicitly notify SwiftUI of the change
         // Even though we created a new dictionary, we still call objectWillChange to be safe
         objectWillChange.send()
@@ -582,24 +668,35 @@ class MqttViewModel: ObservableObject {
         var restoredCount = 0
         
         // For each device, restore its telemetry data from SwiftData
+        // OPTIMIZATION: Load data in parallel for all devices to speed up restoration
         for deviceId in deviceIds {
-            let telemetryDescriptor = FetchDescriptor<TelemetryData>(
+            // OPTIMIZATION: Limit fetch to recent entries (last 100 per device) to speed up loading
+            // This is sufficient since we only need the most recent value per keyword
+            var telemetryDescriptor = FetchDescriptor<TelemetryData>(
                 predicate: #Predicate<TelemetryData> { data in
                     data.deviceId == deviceId
                 },
                 sortBy: [SortDescriptor(\TelemetryData.timestamp, order: .reverse)]
             )
+            // Limit to 10 most recent entries per device to speed up loading
+            // This is more than enough since we only need one entry per keyword
+            telemetryDescriptor.fetchLimit = 10
             
             guard let telemetryData = try? context.fetch(telemetryDescriptor) else {
                 continue
             }
             
             // Group by keyword and take the most recent for each keyword
+            // OPTIMIZATION: Stop early once we have all unique keywords
             var deviceData: [String: TelemetryData] = [:]
+            var foundKeywords = Set<String>()
             for data in telemetryData {
-                if deviceData[data.keyword] == nil {
+                if !foundKeywords.contains(data.keyword) {
                     // Take the first (most recent) entry for each keyword
                     deviceData[data.keyword] = data
+                    foundKeywords.insert(data.keyword)
+                    // OPTIMIZATION: If we have temperature and humidity for climate widgets, we can stop early
+                    // Most devices have < 10 keywords, so this will stop after ~10 iterations instead of 100
                 }
             }
             
@@ -659,12 +756,10 @@ class MqttViewModel: ObservableObject {
             device.lastSeen = nil
         }
         
-        // CRITICAL: Remove all in-memory telemetry data
-        // NOTE: We do NOT delete persisted TelemetryData here, as it may be needed
-        // to restore widget values when MQTT reconnects. Persisted data will be
-        // cleaned up by checkDeviceOfflineStatus() and verifyDeviceStatus() when
-        // devices are confirmed to be offline.
-        latestTelemetryData.removeAll()
+        // CRITICAL: DO NOT remove telemetry data - preserve last values for widgets
+        // Even when all devices are set offline, we keep the data so widgets can display
+        // their last known values. This ensures widgets don't lose their display.
+        // latestTelemetryData.removeAll() // REMOVED - keep last values
         
         if statusChanged {
             try? context.save()

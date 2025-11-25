@@ -30,11 +30,25 @@ struct SettingsView: View {
     @State private var keywordUnits: [String: String] = [:]
     @State private var newKeyword: String = ""
     @State private var newKeywordUnit: String = ""
+    @State private var showMqttSavedFeedback: Bool = false
+    @State private var showKeywordAddedFeedback: Bool = false
+    @State private var showKeywordsSavedFeedback: Bool = false
     
     var body: some View {
         NavigationStack {
-            Form {
-                Section("MQTT Broker Settings") {
+            ZStack {
+                // Invisible background to catch taps outside interactive elements
+                // This will dismiss keyboard when tapping on empty areas
+                Color.clear
+                    .contentShape(Rectangle())
+                    .gesture(
+                        TapGesture().onEnded { _ in
+                            hideKeyboard()
+                        }
+                    )
+                
+                Form {
+                    Section("MQTT Broker Settings") {
                     TextField("Host", text: $host)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
@@ -59,14 +73,27 @@ struct SettingsView: View {
                     Button(action: {
                         hideKeyboard()
                         saveBrokerSettings()
+                        showMqttSavedFeedback = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            showMqttSavedFeedback = false
+                        }
                     }) {
                         HStack {
                             Spacer()
-                            Text("Save MQTT Settings")
+                            if showMqttSavedFeedback {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundColor(.green)
+                                    Text("Saved!")
+                                }
+                            } else {
+                                Text("Save MQTT Settings")
+                            }
                             Spacer()
                         }
                     }
                     .disabled(!isValidConfiguration)
+                    .sensoryFeedback(.success, trigger: showMqttSavedFeedback)
                 }
                 
                 Section("Telemetry Keywords") {
@@ -133,13 +160,55 @@ struct SettingsView: View {
                                 .onSubmit { hideKeyboard() }
                         }
                         
-                        Button("Save Keyword") {
+                        Button {
                             hideKeyboard()
                             addKeyword()
-                            saveKeywords()
+                            showKeywordAddedFeedback = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                showKeywordAddedFeedback = false
+                            }
+                        } label: {
+                            HStack {
+                                Spacer()
+                                if showKeywordAddedFeedback {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundColor(.green)
+                                        Text("Added!")
+                                    }
+                                } else {
+                                    Text("Add Keyword")
+                                }
+                                Spacer()
+                            }
                         }
                         .disabled(newKeyword.isEmpty)
+                        .sensoryFeedback(.success, trigger: showKeywordAddedFeedback)
                     }
+                    
+                    Button(action: {
+                        hideKeyboard()
+                        saveKeywords()
+                        showKeywordsSavedFeedback = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            showKeywordsSavedFeedback = false
+                        }
+                    }) {
+                        HStack {
+                            Spacer()
+                            if showKeywordsSavedFeedback {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundColor(.green)
+                                    Text("Saved!")
+                                }
+                            } else {
+                                Text("Save Keywords")
+                            }
+                            Spacer()
+                        }
+                    }
+                    .sensoryFeedback(.success, trigger: showKeywordsSavedFeedback)
                 }
                 
                 Section("Connection Status") {
@@ -183,6 +252,7 @@ struct SettingsView: View {
                         }
                         .font(.caption)
                     }
+                }
                 }
             }
             .navigationTitle("Settings")

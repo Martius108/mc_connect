@@ -281,7 +281,17 @@ struct SliderWidget: View {
     let value: Double?
     @EnvironmentObject var mqttViewModel: MqttViewModel
     @State private var sliderValue: Double = 0.0
+    @State private var inputValue: String = ""
     @State private var isUpdatingFromTelemetry: Bool = false  // Flag to prevent feedback loop
+    @State private var lastSentValue: Double? = nil  // Track last sent value
+    @State private var lastCommandTime: Date? = nil  // Track when we last sent a command
+    @State private var pendingCommand: DispatchWorkItem? = nil  // For debouncing
+    @FocusState private var isInputFocused: Bool
+    
+    // Time windows for better feedback prevention
+    private let commandCooldown: TimeInterval = 0.5  // Ignore telemetry updates for 0.5s after sending command
+    private let debounceDelay: TimeInterval = 0.15  // Debounce command sending by 150ms
+    private let valueTolerance: Double = 2.0  // Ignore telemetry updates within 2 units of sent value
     
     private var isOutput: Bool {
         widget.mode == .output
@@ -295,6 +305,38 @@ struct SliderWidget: View {
         widget.maxValue ?? 1024.0
     }
     
+    private var stepSize: Double {
+        widget.stepSize ?? 1.0
+    }
+    
+    private var valueFormat: String {
+        // Determine format based on step size
+        if stepSize >= 1.0 {
+            return "%.0f"
+        } else if stepSize >= 0.1 {
+            return "%.1f"
+        } else if stepSize >= 0.01 {
+            return "%.2f"
+        } else {
+            return "%.3f"
+        }
+    }
+    
+    // Scale value from widget range to PWM range (0-1024)
+    private func scaleToPWM(_ value: Double) -> Int {
+        let valueRange = maxValue - minValue
+        guard valueRange > 0 else { return 0 }
+        
+        // Normalize value to 0-1 range
+        let normalized = (value - minValue) / valueRange
+        
+        // Scale to 0-1024 PWM range
+        let pwmValue = normalized * 1024.0
+        
+        // Clamp and convert to Int
+        return Int(Swift.max(0, Swift.min(1024, pwmValue)))
+    }
+    
     private var pinNumber: String {
         if let pin = widget.pin {
             return "PIN \(pin)"
@@ -305,97 +347,597 @@ struct SliderWidget: View {
     var body: some View {
         WidgetContainer(widget: widget) {
             GeometryReader { geometry in
-                let baseSize = min(geometry.size.width, geometry.size.height)
-                
-                VStack(spacing: min(baseSize * 0.1, 16)) {
-                    if !pinNumber.isEmpty {
-                        Text(pinNumber)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    
-                    // Current value display
-                    VStack(spacing: 4) {
-                        Text("\(String(format: "%.0f", sliderValue))")
-                            .font(.system(size: min(baseSize * 0.25, 32), weight: .bold, design: .rounded))
-                            .foregroundColor(.blue)
-                            .minimumScaleFactor(0.5)
-                            .lineLimit(1)
-                        
-                        if !widget.unit.isEmpty {
-                            Text(widget.unit)
+                HStack(spacing: 12) {
+                    // Slider section (2/3 of width)
+                    VStack(spacing: 8) {
+                        if !pinNumber.isEmpty {
+                            Text(pinNumber)
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
-                    }
-                    
-                    // Slider
-                    Slider(
-                        value: $sliderValue,
-                        in: minValue...maxValue,
-                        step: 1.0
-                    )
-                    .tint(.blue)
-                    .disabled(!isOutput)
-                    .onChange(of: sliderValue) { oldValue, newValue in
-                        // Nur Command senden, wenn es eine Benutzer-Änderung ist (nicht durch Telemetry-Update)
-                        if isOutput && !isUpdatingFromTelemetry {
-                            sendSliderCommand(newValue)
+                        
+                        // Current value display
+                        VStack(spacing: 4) {
+                            Text(String(format: valueFormat, sliderValue))
+                                .font(.system(size: min(geometry.size.height * 0.2, 24), weight: .bold, design: .rounded))
+                                .foregroundColor(.blue)
+                                .minimumScaleFactor(0.5)
+                                .lineLimit(1)
+                            
+                            if !widget.unit.isEmpty {
+                                Text(widget.unit)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        
+                        // Slider
+                        Slider(
+                            value: $sliderValue,
+                            in: minValue...maxValue,
+                            step: stepSize
+                        )
+                        .tint(.blue)
+                        .disabled(!isOutput)
+                        .onChange(of: sliderValue) { oldValue, newValue in
+                            // Update input field when slider changes
+                            inputValue = String(format: valueFormat, newValue)
+                            // Nur Command senden, wenn es eine Benutzer-Änderung ist (nicht durch Telemetry-Update)
+                            if isOutput && !isUpdatingFromTelemetry {
+                                scheduleSliderCommand(newValue)
+                            }
+                        }
+                        
+                        // Min/Max labels
+                        HStack {
+                            Text(String(format: valueFormat, minValue))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text(String(format: valueFormat, maxValue))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
                         }
                     }
+                    .frame(width: geometry.size.width * 0.67)
                     
-                    // Min/Max labels
-                    HStack {
-                        Text("\(String(format: "%.0f", minValue))")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                    // Input field and button section (1/3 of width)
+                    VStack(spacing: 8) {
                         Spacer()
-                        Text("\(String(format: "%.0f", maxValue))")
+                        
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Value")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            
+                            TextField("", text: $inputValue)
+                                .keyboardType(.decimalPad)
+                                .textFieldStyle(.roundedBorder)
+                                .focused($isInputFocused)
+                                .onSubmit {
+                                    applyInputValue()
+                                }
+                                .onChange(of: inputValue) { oldValue, newValue in
+                                    // Validate input as user types
+                                    if let doubleValue = Double(newValue) {
+                                        let clamped = Swift.max(minValue, Swift.min(maxValue, doubleValue))
+                                        if clamped != doubleValue {
+                                            inputValue = String(format: "%.0f", clamped)
+                                        }
+                                    }
+                                }
+                            
+                            if !widget.unit.isEmpty {
+                                Text(widget.unit)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        
+                        Button(action: {
+                            applyInputValue()
+                        }) {
+                            HStack {
+                                Image(systemName: "checkmark")
+                                Text("Save")
+                            }
                             .font(.caption)
-                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(isOutput ? Color.blue : Color.gray)
+                            .foregroundColor(.white)
+                            .cornerRadius(6)
+                        }
+                        .disabled(!isOutput)
+                        
+                        Spacer()
                     }
+                    .frame(width: geometry.size.width * 0.33)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .onAppear {
                 updateSliderValue()
+                // Initialize input field
+                inputValue = String(format: valueFormat, sliderValue)
             }
             .onChange(of: value) { oldValue, newValue in
                 updateSliderValue()
             }
+            .onDisappear {
+                // Cancel any pending command when view disappears
+                pendingCommand?.cancel()
+            }
+        }
+    }
+    
+    private func applyInputValue() {
+        guard let doubleValue = Double(inputValue) else {
+            // Invalid input, reset to current slider value
+            inputValue = String(format: valueFormat, sliderValue)
+            return
+        }
+        
+        let clampedValue = Swift.max(minValue, Swift.min(maxValue, doubleValue))
+        // Round to nearest step
+        let roundedValue = round(clampedValue / stepSize) * stepSize
+        let finalValue = Swift.max(minValue, Swift.min(maxValue, roundedValue))
+        
+        sliderValue = finalValue
+        inputValue = String(format: valueFormat, finalValue)
+        isInputFocused = false
+        
+        // Send command immediately when user applies value
+        if isOutput {
+            sendSliderCommand(finalValue)
         }
     }
     
     private func updateSliderValue() {
+        // Ignore updates if we're currently updating from telemetry
+        guard !isUpdatingFromTelemetry else { return }
+        
         guard let value = value else {
-            if !isUpdatingFromTelemetry {
-                isUpdatingFromTelemetry = true
-                sliderValue = minValue
-                isUpdatingFromTelemetry = false
+            isUpdatingFromTelemetry = true
+            sliderValue = minValue
+            if !isInputFocused {
+                inputValue = String(format: valueFormat, minValue)
             }
+            isUpdatingFromTelemetry = false
             return
         }
         
         // Clamp value to min/max range
         let newSliderValue = Swift.max(minValue, Swift.min(maxValue, value))
         
-        // Nur aktualisieren, wenn sich der Wert signifikant unterscheidet (Toleranz: 1)
-        // Das verhindert Feedback-Schleifen durch kleine Rundungsunterschiede
-        if abs(sliderValue - newSliderValue) > 1.0 {
+        // Check if we recently sent a command - if so, ignore telemetry updates that are close to the sent value
+        if let lastSent = lastSentValue, let lastCommandTime = lastCommandTime {
+            let timeSinceCommand = Date().timeIntervalSince(lastCommandTime)
+            
+            // If we sent a command recently and the incoming value is close to what we sent, ignore it
+            if timeSinceCommand < commandCooldown {
+                let difference = abs(newSliderValue - lastSent)
+                if difference <= valueTolerance {
+                    // This is likely the echo of our own command - ignore it
+                    return
+                }
+            }
+        }
+        
+        // Only update if the value differs significantly (increased tolerance)
+        if abs(sliderValue - newSliderValue) > valueTolerance {
             isUpdatingFromTelemetry = true
             sliderValue = newSliderValue
-            // Kurze Verzögerung, um sicherzustellen, dass der onChange-Handler nicht getriggert wird
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            // Only update input field if it's not focused (user is not typing)
+            if !isInputFocused {
+                inputValue = String(format: valueFormat, newSliderValue)
+            }
+            // Longer delay to ensure onChange handler doesn't trigger
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                 isUpdatingFromTelemetry = false
             }
         }
     }
     
+    private func scheduleSliderCommand(_ value: Double) {
+        // Cancel any pending command
+        pendingCommand?.cancel()
+        
+        // Create a new debounced command
+        let workItem = DispatchWorkItem {
+            self.sendSliderCommand(value)
+        }
+        pendingCommand = workItem
+        
+        // Schedule the command with debounce delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + debounceDelay, execute: workItem)
+    }
+    
     private func sendSliderCommand(_ value: Double) {
         guard let pin = widget.pin else { return }
         
-        // Convert value to Int (0-1024 for PWM)
-        let pwmValue = Int(Swift.max(0, Swift.min(1024, value)))
+        // Scale value from widget range to PWM range (0-1024)
+        let pwmValue = scaleToPWM(value)
+        
+        // Track what we're sending
+        lastSentValue = value
+        lastCommandTime = Date()
+        
+        // Use standardized command structure: device/{id}/command
+        // Payload format: {"type": "gpio", "pin": X, "value": 0-1024, "mode": "output"}
+        let topic = "device/\(widget.deviceId)/command"
+        
+        // Create standardized GPIO command with PWM value
+        let command = CommandFactory.createGpioCommand(
+            pin: pin,
+            value: pwmValue,
+            mode: widget.mode?.rawValue.lowercased()
+        )
+        
+        guard let payload = command.toJSON() else {
+            return
+        }
+        
+        _ = mqttViewModel.publishCommand(topic: topic, payload: payload)
+    }
+}
+
+// Knob Widget (Rotary Control for PWM/Analog Output)
+struct KnobWidget: View {
+    let widget: Widget
+    let value: Double?
+    @EnvironmentObject var mqttViewModel: MqttViewModel
+    @State private var knobValue: Double = 0.0
+    @State private var inputValue: String = ""
+    @State private var isUpdatingFromTelemetry: Bool = false  // Flag to prevent feedback loop
+    @State private var lastSentValue: Double? = nil  // Track last sent value
+    @State private var lastCommandTime: Date? = nil  // Track when we last sent a command
+    @State private var pendingCommand: DispatchWorkItem? = nil  // For debouncing
+    @State private var rotationAngle: Double = 0.0  // Current rotation angle in degrees
+    @FocusState private var isInputFocused: Bool
+    
+    // Time windows for better feedback prevention
+    private let commandCooldown: TimeInterval = 0.5  // Ignore telemetry updates for 0.5s after sending command
+    private let debounceDelay: TimeInterval = 0.15  // Debounce command sending by 150ms
+    private let valueTolerance: Double = 2.0  // Ignore telemetry updates within 2 units of sent value
+    
+    // Knob rotation range: -135° to +135° (270° total range)
+    private let minAngle: Double = -135.0
+    private let maxAngle: Double = 135.0
+    private let angleRange: Double = 270.0
+    
+    private var isOutput: Bool {
+        widget.mode == .output
+    }
+    
+    private var minValue: Double {
+        widget.minValue ?? 0.0
+    }
+    
+    private var maxValue: Double {
+        widget.maxValue ?? 1024.0
+    }
+    
+    private var stepSize: Double {
+        widget.stepSize ?? 1.0
+    }
+    
+    private var valueRange: Double {
+        maxValue - minValue
+    }
+    
+    private var valueFormat: String {
+        // Determine format based on step size
+        if stepSize >= 1.0 {
+            return "%.0f"
+        } else if stepSize >= 0.1 {
+            return "%.1f"
+        } else if stepSize >= 0.01 {
+            return "%.2f"
+        } else {
+            return "%.3f"
+        }
+    }
+    
+    // Scale value from widget range to PWM range (0-1024)
+    private func scaleToPWM(_ value: Double) -> Int {
+        let valueRange = maxValue - minValue
+        guard valueRange > 0 else { return 0 }
+        
+        // Normalize value to 0-1 range
+        let normalized = (value - minValue) / valueRange
+        
+        // Scale to 0-1024 PWM range
+        let pwmValue = normalized * 1024.0
+        
+        // Clamp and convert to Int
+        return Int(Swift.max(0, Swift.min(1024, pwmValue)))
+    }
+    
+    private var pinNumber: String {
+        if let pin = widget.pin {
+            return "PIN \(pin)"
+        }
+        return ""
+    }
+    
+    // Convert value to angle
+    private func valueToAngle(_ value: Double) -> Double {
+        let normalized = (value - minValue) / valueRange
+        return minAngle + (normalized * angleRange)
+    }
+    
+    // Convert angle to value
+    private func angleToValue(_ angle: Double) -> Double {
+        let clampedAngle = Swift.max(minAngle, Swift.min(maxAngle, angle))
+        let normalized = (clampedAngle - minAngle) / angleRange
+        return minValue + (normalized * valueRange)
+    }
+    
+    var body: some View {
+        WidgetContainer(widget: widget) {
+            GeometryReader { geometry in
+                HStack(spacing: 12) {
+                    // Knob section (1/2 of width)
+                    VStack(spacing: 8) {
+                        if !pinNumber.isEmpty {
+                            Text(pinNumber)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        // Current value display
+                        VStack(spacing: 4) {
+                            Text(String(format: valueFormat, knobValue))
+                                .font(.system(size: min(geometry.size.height * 0.15, 20), weight: .bold, design: .rounded))
+                                .foregroundColor(.blue)
+                                .minimumScaleFactor(0.5)
+                                .lineLimit(1)
+                            
+                            if !widget.unit.isEmpty {
+                                Text(widget.unit)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        
+                        // Knob
+                        GeometryReader { knobGeometry in
+                            let knobSize = min(knobGeometry.size.width, knobGeometry.size.height)
+                            let center = CGPoint(x: knobSize / 2, y: knobSize / 2)
+                            
+                            ZStack {
+                                // Background circle
+                                Circle()
+                                    .fill(Color(.systemGray5))
+                                    .frame(width: knobSize, height: knobSize)
+                                
+                                // Value indicator arc
+                                Circle()
+                                    .trim(from: 0, to: CGFloat((rotationAngle - minAngle) / angleRange))
+                                    .stroke(Color.blue, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                                    .frame(width: knobSize, height: knobSize)
+                                    .rotationEffect(.degrees(-90))
+                                
+                                // Knob pointer
+                                Circle()
+                                    .fill(Color.blue)
+                                    .frame(width: 8, height: 8)
+                                    .offset(y: -knobSize / 2)
+                                    .rotationEffect(.degrees(rotationAngle))
+                            }
+                            .frame(width: knobSize, height: knobSize)
+                            .gesture(
+                                DragGesture(minimumDistance: 0)
+                                    .onChanged { gesture in
+                                        guard isOutput else { return }
+                                        
+                                        let deltaX = gesture.location.x - center.x
+                                        let deltaY = gesture.location.y - center.y
+                                        
+                                        // Calculate angle from center (0° is up, positive is clockwise)
+                                        var angle = atan2(deltaX, -deltaY) * 180 / .pi
+                                        
+                                        // Clamp angle to valid range
+                                        angle = Swift.max(minAngle, Swift.min(maxAngle, angle))
+                                        
+                                    rotationAngle = angle
+                                    let rawValue = angleToValue(angle)
+                                    // Round to nearest step
+                                    let newValue = round(rawValue / stepSize) * stepSize
+                                    let clampedValue = Swift.max(minValue, Swift.min(maxValue, newValue))
+                                    knobValue = clampedValue
+                                    inputValue = String(format: valueFormat, clampedValue)
+                                    
+                                    // Schedule command
+                                    if !isUpdatingFromTelemetry {
+                                        scheduleKnobCommand(clampedValue)
+                                    }
+                                    }
+                            )
+                            .disabled(!isOutput)
+                        }
+                        .frame(width: min(geometry.size.height * 0.5, geometry.size.width * 0.4), height: min(geometry.size.height * 0.5, geometry.size.width * 0.4))
+                        
+                        // Min/Max labels
+                        HStack {
+                            Text(String(format: valueFormat, minValue))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text(String(format: valueFormat, maxValue))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(width: min(geometry.size.height * 0.5, geometry.size.width * 0.4))
+                    }
+                    .frame(width: geometry.size.width * 0.5)
+                    
+                    // Input field and button section (1/2 of width)
+                    VStack(spacing: 8) {
+                        Spacer()
+                        
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Value")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            
+                            TextField("", text: $inputValue)
+                                .keyboardType(.decimalPad)
+                                .textFieldStyle(.roundedBorder)
+                                .focused($isInputFocused)
+                                .onSubmit {
+                                    applyInputValue()
+                                }
+                                .onChange(of: inputValue) { oldValue, newValue in
+                                    // Validate input as user types
+                                    if let doubleValue = Double(newValue) {
+                                        let clamped = Swift.max(minValue, Swift.min(maxValue, doubleValue))
+                                        if clamped != doubleValue {
+                                            inputValue = String(format: "%.0f", clamped)
+                                        }
+                                    }
+                                }
+                            
+                            if !widget.unit.isEmpty {
+                                Text(widget.unit)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        
+                        Button(action: {
+                            applyInputValue()
+                        }) {
+                            HStack {
+                                Image(systemName: "checkmark")
+                                Text("Save")
+                            }
+                            .font(.caption)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(isOutput ? Color.blue : Color.gray)
+                            .foregroundColor(.white)
+                            .cornerRadius(6)
+                        }
+                        .disabled(!isOutput)
+                        
+                        Spacer()
+                    }
+                    .frame(width: geometry.size.width * 0.5)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .onAppear {
+                updateKnobValue()
+                // Initialize input field and rotation angle
+                inputValue = String(format: valueFormat, knobValue)
+                rotationAngle = valueToAngle(knobValue)
+            }
+            .onChange(of: value) { oldValue, newValue in
+                updateKnobValue()
+            }
+            .onDisappear {
+                // Cancel any pending command when view disappears
+                pendingCommand?.cancel()
+            }
+        }
+    }
+    
+    private func applyInputValue() {
+        guard let doubleValue = Double(inputValue) else {
+            // Invalid input, reset to current knob value
+            inputValue = String(format: valueFormat, knobValue)
+            return
+        }
+        
+        let clampedValue = Swift.max(minValue, Swift.min(maxValue, doubleValue))
+        // Round to nearest step
+        let roundedValue = round(clampedValue / stepSize) * stepSize
+        let finalValue = Swift.max(minValue, Swift.min(maxValue, roundedValue))
+        
+        knobValue = finalValue
+        rotationAngle = valueToAngle(finalValue)
+        inputValue = String(format: valueFormat, finalValue)
+        isInputFocused = false
+        
+        // Send command immediately when user applies value
+        if isOutput {
+            sendKnobCommand(finalValue)
+        }
+    }
+    
+    private func updateKnobValue() {
+        // Ignore updates if we're currently updating from telemetry
+        guard !isUpdatingFromTelemetry else { return }
+        
+        guard let value = value else {
+            isUpdatingFromTelemetry = true
+            knobValue = minValue
+            rotationAngle = valueToAngle(minValue)
+            if !isInputFocused {
+                inputValue = String(format: valueFormat, minValue)
+            }
+            isUpdatingFromTelemetry = false
+            return
+        }
+        
+        // Clamp value to min/max range
+        let newKnobValue = Swift.max(minValue, Swift.min(maxValue, value))
+        
+        // Check if we recently sent a command - if so, ignore telemetry updates that are close to the sent value
+        if let lastSent = lastSentValue, let lastCommandTime = lastCommandTime {
+            let timeSinceCommand = Date().timeIntervalSince(lastCommandTime)
+            
+            // If we sent a command recently and the incoming value is close to what we sent, ignore it
+            if timeSinceCommand < commandCooldown {
+                let difference = abs(newKnobValue - lastSent)
+                if difference <= valueTolerance {
+                    // This is likely the echo of our own command - ignore it
+                    return
+                }
+            }
+        }
+        
+        // Only update if the value differs significantly (increased tolerance)
+        if abs(knobValue - newKnobValue) > valueTolerance {
+            isUpdatingFromTelemetry = true
+            knobValue = newKnobValue
+            rotationAngle = valueToAngle(newKnobValue)
+            // Only update input field if it's not focused (user is not typing)
+            if !isInputFocused {
+                inputValue = String(format: valueFormat, newKnobValue)
+            }
+            // Longer delay to ensure onChange handler doesn't trigger
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                isUpdatingFromTelemetry = false
+            }
+        }
+    }
+    
+    private func scheduleKnobCommand(_ value: Double) {
+        // Cancel any pending command
+        pendingCommand?.cancel()
+        
+        // Create a new debounced command
+        let workItem = DispatchWorkItem {
+            self.sendKnobCommand(value)
+        }
+        pendingCommand = workItem
+        
+        // Schedule the command with debounce delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + debounceDelay, execute: workItem)
+    }
+    
+    private func sendKnobCommand(_ value: Double) {
+        guard let pin = widget.pin else { return }
+        
+        // Scale value from widget range to PWM range (0-1024)
+        let pwmValue = scaleToPWM(value)
+        
+        // Track what we're sending
+        lastSentValue = value
+        lastCommandTime = Date()
         
         // Use standardized command structure: device/{id}/command
         // Payload format: {"type": "gpio", "pin": X, "value": 0-1024, "mode": "output"}
@@ -807,26 +1349,29 @@ struct TwoValueWidget: View {
     var body: some View {
         WidgetContainer(widget: widget) {
             GeometryReader { geometry in
-                let baseSize = min(geometry.size.width, geometry.size.height)
-                let valueSize = min(baseSize * 0.2, 24)
+                let availableHeight = geometry.size.height
+                // Use the same font sizing logic as ValueWidget
+                // 50% of available height, max 48pt - same as ValueWidget
+                let fontSize = min(availableHeight * 0.5, 48)
+                let unitSize = fontSize * 0.5 // Unit is half the value size - same as ValueWidget
                 
-                HStack(spacing: min(baseSize * 0.13, 16)) {
-                    // First Value
+                HStack(spacing: 16) {
+                    // First Value - styled exactly like ValueWidget
                     VStack(spacing: 4) {
                         if let value = firstValueData?.value {
                             let displayUnit = widget.unit.isEmpty ? (firstValueData?.unit ?? "") : widget.unit
-                            // Analog style - large number with unit
-                            VStack(spacing: 4) {
-                                HStack(alignment: .firstTextBaseline, spacing: 4) {
-                                    Text(String(format: "%.2f", value))
-                                        .font(.system(size: valueSize, weight: .bold, design: .rounded))
-                                        .minimumScaleFactor(0.5)
+                            // Analog style - large number with unit, same as ValueWidget
+                            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                                Text(String(format: "%.2f", value))
+                                    .font(.system(size: max(fontSize, 24), weight: .bold, design: .rounded))
+                                    .minimumScaleFactor(0.6)
+                                    .lineLimit(1)
+                                if !displayUnit.isEmpty {
+                                    Text(displayUnit)
+                                        .font(.system(size: max(unitSize, 16)))
+                                        .foregroundColor(.secondary)
+                                        .minimumScaleFactor(0.6)
                                         .lineLimit(1)
-                                    if !displayUnit.isEmpty {
-                                        Text(displayUnit)
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                    }
                                 }
                             }
                         } else {
@@ -835,24 +1380,24 @@ struct TwoValueWidget: View {
                                 .foregroundColor(.secondary)
                         }
                     }
-                    .frame(maxWidth: .infinity)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     
-                    // Second Value
+                    // Second Value - styled exactly like ValueWidget
                     VStack(spacing: 4) {
                         if let value = secondValueData?.value {
                             let displayUnit = (widget.secondaryUnit ?? "").isEmpty ? (secondValueData?.unit ?? "") : (widget.secondaryUnit ?? "")
-                            // Analog style - large number with unit
-                            VStack(spacing: 4) {
-                                HStack(alignment: .firstTextBaseline, spacing: 4) {
-                                    Text(String(format: "%.2f", value))
-                                        .font(.system(size: valueSize, weight: .bold, design: .rounded))
-                                        .minimumScaleFactor(0.5)
+                            // Analog style - large number with unit, same as ValueWidget
+                            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                                Text(String(format: "%.2f", value))
+                                    .font(.system(size: max(fontSize, 24), weight: .bold, design: .rounded))
+                                    .minimumScaleFactor(0.6)
+                                    .lineLimit(1)
+                                if !displayUnit.isEmpty {
+                                    Text(displayUnit)
+                                        .font(.system(size: max(unitSize, 16)))
+                                        .foregroundColor(.secondary)
+                                        .minimumScaleFactor(0.6)
                                         .lineLimit(1)
-                                    if !displayUnit.isEmpty {
-                                        Text(displayUnit)
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                    }
                                 }
                             }
                         } else {
@@ -861,7 +1406,7 @@ struct TwoValueWidget: View {
                                 .foregroundColor(.secondary)
                         }
                     }
-                    .frame(maxWidth: .infinity)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -1065,6 +1610,8 @@ struct UniversalWidgetView: View {
                 SwitchWidget(widget: widget, value: primaryData?.value)
             case .slider:
                 SliderWidget(widget: widget, value: primaryData?.value)
+            case .knob:
+                KnobWidget(widget: widget, value: primaryData?.value)
             case .progress:
                 ProgressBarWidget(widget: widget, value: primaryData?.value)
             case .value:

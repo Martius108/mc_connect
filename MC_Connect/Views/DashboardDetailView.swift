@@ -75,6 +75,11 @@ struct DashboardDetailView: View {
             EditWidgetView(dashboard: dashboard, widget: widget)
         }
         .task {
+            // CRITICAL: Set required device:keyword combinations for prioritization
+            // This ensures messages from devices that haven't sent data yet are processed first
+            let requiredDeviceKeywords = getRequiredDeviceKeywords()
+            mqttViewModel.setRequiredDeviceKeywords(requiredDeviceKeywords)
+            
             // CRITICAL: This runs BEFORE the view is rendered (via .task)
             // First, restore telemetry data for online devices if MQTT is already connected
             // This preserves widget values when returning to the dashboard
@@ -100,6 +105,11 @@ struct DashboardDetailView: View {
             await verifyDeviceStatus()
         }
         .onAppear {
+            // CRITICAL: Set required device:keyword combinations for prioritization
+            // This ensures messages from devices that haven't sent data yet are processed first
+            let requiredDeviceKeywords = getRequiredDeviceKeywords()
+            mqttViewModel.setRequiredDeviceKeywords(requiredDeviceKeywords)
+            
             // Check if device list has changed
             let currentDeviceIds = Set(dashboard.deviceIds)
             
@@ -140,6 +150,9 @@ struct DashboardDetailView: View {
             let newSet = Set(newIds)
             if oldSet != newSet {
                 lastKnownDeviceIds = newSet
+                // Update required device keywords
+                let requiredDeviceKeywords = getRequiredDeviceKeywords()
+                mqttViewModel.setRequiredDeviceKeywords(requiredDeviceKeywords)
                 // Trigger a full refresh when device list changes
                 autoConnectMQTT()
             }
@@ -147,6 +160,11 @@ struct DashboardDetailView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("ReconnectMQTT"))) { _ in
             // Reconnect MQTT when device is added or deleted
             reconnectMQTT()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("VerifyMQTTConnection"))) { _ in
+            // Verify MQTT connection and subscriptions when app becomes active
+            // This ensures subscriptions are still active after screen lock/background
+            verifyAndRestoreConnection()
         }
     }
     
@@ -176,7 +194,7 @@ struct DashboardDetailView: View {
             
             if !hasCurrentMessages {
                 // Device has no current messages - it's truly offline
-                // Mark as offline and clean up its data
+                // Mark as offline but DO NOT delete telemetry data - keep last values for widgets
                 if device.isOnline {
                     device.isOnline = false
                     statusChanged = true
@@ -185,10 +203,10 @@ struct DashboardDetailView: View {
                     device.lastSeen = nil
                     statusChanged = true
                 }
-                // CRITICAL: Remove in-memory telemetry data only for offline devices
-                mqttViewModel.latestTelemetryData.removeValue(forKey: device.id)
-                // CRITICAL: Delete persisted TelemetryData only for offline devices
-                deletePersistedTelemetryData(for: device.id)
+                // CRITICAL: DO NOT remove telemetry data - preserve last values for widgets
+                // This ensures widgets continue to display their last known values even when device goes offline
+                // mqttViewModel.latestTelemetryData.removeValue(forKey: device.id) // REMOVED
+                // deletePersistedTelemetryData(for: device.id) // REMOVED
             } else {
                 // Device has current messages - it's online
                 // Verify it's marked as online (handleMessage should have done this)
@@ -720,10 +738,57 @@ struct DashboardDetailView: View {
         }
     }
     
+    private func verifyAndRestoreConnection() {
+        // Verify MQTT connection and subscriptions after app becomes active from background/screen lock
+        // This is called when the app becomes active again to ensure everything is still working
+        guard case .connected = mqttViewModel.connectionState else {
+            // Not connected - try to reconnect
+            ensureMQTTConnected()
+            return
+        }
+        
+        // Connection is active - verify subscriptions are still working
+        // Re-subscribe to all devices in this dashboard to ensure we don't miss messages
+        // This is safe even if already subscribed - MQTT handles duplicate subscriptions gracefully
+        let dashboardDeviceIds = Set(dashboard.deviceIds)
+        let dashboardDevices = devices.filter { dashboardDeviceIds.contains($0.id) }
+        
+        if !dashboardDevices.isEmpty {
+            let keywords = telemetryConfigs.first?.keywords ?? []
+            // Re-subscribe to ensure subscriptions are active
+            // This is important because iOS may have suspended the connection and subscriptions
+            mqttViewModel.subscribeToAllDevices(devices: dashboardDevices, telemetryKeywords: keywords)
+        }
+    }
+    
+    /// Gets the required device:keyword combinations for all widgets in this dashboard
+    /// Returns a Set of strings in the format "deviceId:keyword"
+    private func getRequiredDeviceKeywords() -> Set<String> {
+        var requiredKeywords: Set<String> = []
+        
+        for widget in widgets {
+            // Add primary keyword
+            let primaryKey = "\(widget.deviceId):\(widget.telemetryKeyword)"
+            requiredKeywords.insert(primaryKey)
+            
+            // Add secondary keyword if present (for klima and twoValue widgets)
+            if let secondaryKeyword = widget.secondaryTelemetryKeyword {
+                let secondaryKey = "\(widget.deviceId):\(secondaryKeyword)"
+                requiredKeywords.insert(secondaryKey)
+            }
+        }
+        
+        return requiredKeywords
+    }
+    
     private func deleteWidget(_ widget: Widget) {
         withAnimation {
             dashboard.widgets?.removeAll { $0.id == widget.id }
             modelContext.delete(widget)
+            
+            // Update required device keywords after widget deletion
+            let requiredDeviceKeywords = getRequiredDeviceKeywords()
+            mqttViewModel.setRequiredDeviceKeywords(requiredDeviceKeywords)
         }
     }
     
@@ -768,6 +833,7 @@ struct AddWidgetView: View {
     @State private var humidityMinValue: String = ""
     @State private var humidityMaxValue: String = ""
     @State private var buttonDuration: String = "100"
+    @State private var stepSize: String = "1.0"
     
     var availableDevices: [Device] {
         dashboard.deviceIds.compactMap { deviceId in
@@ -802,6 +868,9 @@ struct AddWidgetView: View {
                             selectedWidth = .full
                             selectedHeight = .quarter
                             secondaryKeyword = ""
+                        } else if newType == .slider || newType == .knob {
+                            selectedWidth = .full
+                            selectedHeight = .half
                         }
                     }
                     
@@ -905,24 +974,35 @@ struct AddWidgetView: View {
                             Text(width.rawValue).tag(width)
                         }
                     }
-                    .disabled(selectedWidgetType == .klima || selectedWidgetType == .twoValue)
+                    .disabled(selectedWidgetType == .klima || selectedWidgetType == .twoValue || selectedWidgetType == .slider || selectedWidgetType == .knob)
                     
                     Picker("Height", selection: $selectedHeight) {
                         ForEach(WidgetHeight.allCases, id: \.self) { height in
                             Text(height.rawValue).tag(height)
                         }
                     }
-                    .disabled(selectedWidgetType == .klima || selectedWidgetType == .twoValue)
+                    .disabled(selectedWidgetType == .klima || selectedWidgetType == .twoValue || selectedWidgetType == .slider || selectedWidgetType == .knob)
                 }
                 
-                if selectedWidgetType == .gauge || selectedWidgetType == .progress || selectedWidgetType == .slider {
+                if selectedWidgetType == .gauge || selectedWidgetType == .progress || selectedWidgetType == .slider || selectedWidgetType == .knob {
                     Section("Range") {
                         TextField("Min Value (default: 0)", text: $minValue)
                             .keyboardType(.decimalPad)
                             .onSubmit { hideKeyboard() }
-                        TextField("Max Value (default: 100)", text: $maxValue)
+                        TextField("Max Value (default: 1024)", text: $maxValue)
                             .keyboardType(.decimalPad)
                             .onSubmit { hideKeyboard() }
+                    }
+                }
+                
+                if selectedWidgetType == .slider || selectedWidgetType == .knob {
+                    Section("Step Size") {
+                        TextField("Step Size (default: 1.0)", text: $stepSize)
+                            .keyboardType(.decimalPad)
+                            .onSubmit { hideKeyboard() }
+                        Text("Examples: 1.0 (integers), 0.1 (decimals), 0.01 (fine control)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
                 }
                 
@@ -930,15 +1010,19 @@ struct AddWidgetView: View {
                     Section("Temperature Range") {
                         TextField("Min Value (default: 0)", text: $temperatureMinValue)
                             .keyboardType(.decimalPad)
+                            .onSubmit { hideKeyboard() }
                         TextField("Max Value (default: 100)", text: $temperatureMaxValue)
                             .keyboardType(.decimalPad)
+                            .onSubmit { hideKeyboard() }
                     }
                     
                     Section("Humidity Range") {
                         TextField("Min Value (default: 0)", text: $humidityMinValue)
                             .keyboardType(.decimalPad)
+                            .onSubmit { hideKeyboard() }
                         TextField("Max Value (default: 100)", text: $humidityMaxValue)
                             .keyboardType(.decimalPad)
+                            .onSubmit { hideKeyboard() }
                     }
                 }
                 
@@ -960,8 +1044,8 @@ struct AddWidgetView: View {
                     }
                 }
                 
-                if selectedWidgetType == .slider {
-                    Section("Slider Configuration") {
+                if selectedWidgetType == .slider || selectedWidgetType == .knob {
+                    Section(selectedWidgetType == .slider ? "Slider Configuration" : "Knob Configuration") {
                         TextField("PIN Number", text: $pin)
                             .keyboardType(.numberPad)
                             .onSubmit { hideKeyboard() }
@@ -1108,7 +1192,8 @@ struct AddWidgetView: View {
             temperatureMaxValue: selectedWidgetType == .klima ? Double(temperatureMaxValue) : nil,
             humidityMinValue: selectedWidgetType == .klima ? Double(humidityMinValue) : nil,
             humidityMaxValue: selectedWidgetType == .klima ? Double(humidityMaxValue) : nil,
-            buttonDuration: selectedWidgetType == .button ? Double(buttonDuration) : nil
+            buttonDuration: selectedWidgetType == .button ? Double(buttonDuration) : nil,
+            stepSize: (selectedWidgetType == .slider || selectedWidgetType == .knob) ? Double(stepSize) : nil
         )
         
         if dashboard.widgets == nil {
@@ -1150,6 +1235,7 @@ struct EditWidgetView: View {
     @State private var humidityMinValue: String = ""
     @State private var humidityMaxValue: String = ""
     @State private var buttonDuration: String = "100"
+    @State private var stepSize: String = "1.0"
     
     var availableDevices: [Device] {
         dashboard.deviceIds.compactMap { deviceId in
@@ -1274,24 +1360,35 @@ struct EditWidgetView: View {
                             Text(width.rawValue).tag(width)
                         }
                     }
-                    .disabled(selectedWidgetType == .klima || selectedWidgetType == .twoValue)
+                    .disabled(selectedWidgetType == .klima || selectedWidgetType == .twoValue || selectedWidgetType == .slider || selectedWidgetType == .knob)
                     
                     Picker("Height", selection: $selectedHeight) {
                         ForEach(WidgetHeight.allCases, id: \.self) { height in
                             Text(height.rawValue).tag(height)
                         }
                     }
-                    .disabled(selectedWidgetType == .klima || selectedWidgetType == .twoValue)
+                    .disabled(selectedWidgetType == .klima || selectedWidgetType == .twoValue || selectedWidgetType == .slider || selectedWidgetType == .knob)
                 }
                 
-                if selectedWidgetType == .gauge || selectedWidgetType == .progress || selectedWidgetType == .slider {
+                if selectedWidgetType == .gauge || selectedWidgetType == .progress || selectedWidgetType == .slider || selectedWidgetType == .knob {
                     Section("Range") {
                         TextField("Min Value (default: 0)", text: $minValue)
                             .keyboardType(.decimalPad)
                             .onSubmit { hideKeyboard() }
-                        TextField("Max Value (default: 100)", text: $maxValue)
+                        TextField("Max Value (default: 1024)", text: $maxValue)
                             .keyboardType(.decimalPad)
                             .onSubmit { hideKeyboard() }
+                    }
+                }
+                
+                if selectedWidgetType == .slider || selectedWidgetType == .knob {
+                    Section("Step Size") {
+                        TextField("Step Size (default: 1.0)", text: $stepSize)
+                            .keyboardType(.decimalPad)
+                            .onSubmit { hideKeyboard() }
+                        Text("Examples: 1.0 (integers), 0.1 (decimals), 0.01 (fine control)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
                 }
                 
@@ -1299,15 +1396,19 @@ struct EditWidgetView: View {
                     Section("Temperature Range") {
                         TextField("Min Value (default: 0)", text: $temperatureMinValue)
                             .keyboardType(.decimalPad)
+                            .onSubmit { hideKeyboard() }
                         TextField("Max Value (default: 100)", text: $temperatureMaxValue)
                             .keyboardType(.decimalPad)
+                            .onSubmit { hideKeyboard() }
                     }
                     
                     Section("Humidity Range") {
                         TextField("Min Value (default: 0)", text: $humidityMinValue)
                             .keyboardType(.decimalPad)
+                            .onSubmit { hideKeyboard() }
                         TextField("Max Value (default: 100)", text: $humidityMaxValue)
                             .keyboardType(.decimalPad)
+                            .onSubmit { hideKeyboard() }
                     }
                 }
                 
@@ -1329,8 +1430,8 @@ struct EditWidgetView: View {
                     }
                 }
                 
-                if selectedWidgetType == .slider {
-                    Section("Slider Configuration") {
+                if selectedWidgetType == .slider || selectedWidgetType == .knob {
+                    Section(selectedWidgetType == .slider ? "Slider Configuration" : "Knob Configuration") {
                         TextField("PIN Number", text: $pin)
                             .keyboardType(.numberPad)
                             .onSubmit { hideKeyboard() }
@@ -1440,6 +1541,7 @@ struct EditWidgetView: View {
                 humidityMinValue = widget.humidityMinValue != nil ? String(widget.humidityMinValue!) : ""
                 humidityMaxValue = widget.humidityMaxValue != nil ? String(widget.humidityMaxValue!) : ""
                 buttonDuration = widget.buttonDuration != nil ? String(Int(widget.buttonDuration!)) : "100"
+                stepSize = widget.stepSize != nil ? String(widget.stepSize!) : "1.0"
             }
         }
     }
@@ -1509,6 +1611,13 @@ struct EditWidgetView: View {
         
         // Set button duration for button widgets
         widget.buttonDuration = selectedWidgetType == .button ? Double(buttonDuration) : nil
+        
+        // Set step size for slider/knob widgets
+        if selectedWidgetType == .slider || selectedWidgetType == .knob {
+            widget.stepSize = Double(stepSize)
+        } else {
+            widget.stepSize = nil
+        }
         
         dismiss()
     }

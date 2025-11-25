@@ -42,6 +42,7 @@ enum WidgetType: String, Codable, CaseIterable {
     case gauge = "Gauge"
     case switchType = "Switch"
     case slider = "Slider"
+    case knob = "Knob"
     case progress = "Progress Bar"
     case value = "Value"
     case sensorAnalog = "Sensor Analog"
@@ -96,6 +97,7 @@ final class Widget {
     var humidityMinValue: Double? // Min value for humidity in klima widget
     var humidityMaxValue: Double? // Max value for humidity in klima widget
     var buttonDuration: Double? // Button press duration in milliseconds
+    var stepSize: Double? // Step size for slider/knob widgets (default: 1.0)
     
     init(
         id: UUID = UUID(),
@@ -119,7 +121,8 @@ final class Widget {
         temperatureMaxValue: Double? = nil,
         humidityMinValue: Double? = nil,
         humidityMaxValue: Double? = nil,
-        buttonDuration: Double? = nil
+        buttonDuration: Double? = nil,
+        stepSize: Double? = nil
     ) {
         self.id = id
         self.title = title
@@ -143,6 +146,7 @@ final class Widget {
         self.humidityMinValue = humidityMinValue
         self.humidityMaxValue = humidityMaxValue
         self.buttonDuration = buttonDuration
+        self.stepSize = stepSize
     }
     
     var type: WidgetType {
